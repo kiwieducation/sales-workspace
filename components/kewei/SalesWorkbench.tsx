@@ -1,76 +1,354 @@
+
 "use client";
 
-
-import React, { useState, useEffect } from 'react';
-import { 
-  MessageSquare, 
-  UserPlus, 
-  Timer, 
-  Sparkles, 
-  PhoneCall, 
-  FileText, 
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  MessageSquare,
+  UserPlus,
+  Timer,
+  Sparkles,
+  PhoneCall,
+  FileText,
   ExternalLink,
-  ChevronRight,
   MoreVertical,
-  History,
-  Image as ImageIcon,
   RefreshCw,
   X,
-  Plus
-} from 'lucide-react';
-import { Customer, ChatRecord } from '@/lib/kewei/types';
+  Send,
+} from "lucide-react";
+import { createClient } from "@/lib/supabase/client";
 
-const INITIAL_MOCK_CUSTOMERS: any[] = [
-  { id: '1', name: '王同学', school: '美高 11年级', status: '待回复', time: '10分钟前', risk: true, grade: '11', age: 17, schoolType: '美高', source: 'WeChat' },
-  { id: '2', name: '李妈妈', school: '上海公办高二', status: '跟进中', time: '2小时前', risk: false, grade: '11', age: 45, schoolType: '公办高中', source: 'WeChat' },
-  { id: '3', name: '陈同学', school: '美本转学意向', status: '已约访', time: '昨天', risk: false, grade: '大一', age: 19, schoolType: '大学', source: 'Manual' },
-];
+type Role = "admin" | "consultant" | "viewer";
 
-const SalesWorkbench: React.FC = () => {
-  const [customers, setCustomers] = useState(INITIAL_MOCK_CUSTOMERS);
-  const [selectedId, setSelectedId] = useState('1');
+type ConversationRow = {
+  id: string;
+  last_message_at: string | null;
+  created_at: string | null;
+  customer: {
+    id: string;
+    name: string;
+    grade: number | null;
+    age: number | null;
+    school_type: string | null;
+  } | null;
+  owner: {
+    id: string;
+    name: string | null;
+    role: Role | null;
+  } | null;
+};
+
+type MessageRow = {
+  id: string;
+  conversation_id: string;
+  sender_type: "user" | "customer";
+  sender_id: string | null;
+  content: string;
+  created_at: string;
+  sender: { id: string; name: string | null } | null;
+};
+
+type InsightRow = {
+  id: string;
+  customer_id: string;
+  emotion_score: number | null;
+  engagement_level: string | null;
+  historical_notes: any;
+  tags: any;
+};
+
+type SuggestionRow = {
+  id: string;
+  conversation_id: string;
+  stage: string;
+  suggestion_type: string;
+  title: string;
+  content: string;
+  priority: number | null;
+};
+
+function timeLabel(iso?: string | null) {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  const diff = Date.now() - t;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "刚刚";
+  if (m < 60) return `${m}分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}小时前`;
+  const d = Math.floor(h / 24);
+  return `${d}天前`;
+}
+
+function schoolLabel(c: ConversationRow["customer"]) {
+  if (!c) return "";
+  const parts: string[] = [];
+  if (c.school_type) parts.push(c.school_type);
+  if (c.grade !== null && c.grade !== undefined) parts.push(`${c.grade}年级`);
+  if (!parts.length) return "";
+  return parts.join(" ");
+}
+
+export default function SalesWorkbench() {
+  const supabase = useMemo(() => createClient(), []);
+
+  // auth/profile
+  const [me, setMe] = useState<{ id: string; email: string | null; role: Role | null; name: string | null } | null>(null);
+
+  // conversations
+  const [conversations, setConversations] = useState<ConversationRow[]>([]);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const selectedConversation = useMemo(
+    () => conversations.find((c) => c.id === selectedConversationId) || conversations[0] || null,
+    [conversations, selectedConversationId]
+  );
+  const selectedCustomer = selectedConversation?.customer || null;
+
+  // messages
+  const [messages, setMessages] = useState<MessageRow[]>([]);
+  const [messageInput, setMessageInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const listEndRef = useRef<HTMLDivElement>(null);
+
+  // right panel
+  const [insight, setInsight] = useState<InsightRow | null>(null);
+  const [suggestions, setSuggestions] = useState<SuggestionRow[]>([]);
+
+  // ui
   const [isSyncing, setIsSyncing] = useState(false);
   const [showManualModal, setShowManualModal] = useState(false);
-  
+
   // Manual Form State
   const [newCustomer, setNewCustomer] = useState({
-    name: '',
-    grade: '',
-    age: '',
-    schoolType: '',
-    history: ''
+    name: "",
+    grade: "",
+    age: "",
+    schoolType: "",
+    history: "",
   });
 
-  const selectedCustomer = customers.find(c => c.id === selectedId) || customers[0];
+  async function loadMe() {
+    const { data } = await supabase.auth.getUser();
+    const user = data.user;
+    if (!user) {
+      setMe(null);
+      return null;
+    }
 
-  const handleSyncWeChat = () => {
+    const { data: p } = await supabase
+      .from("profiles")
+      .select("id,name,role")
+      .eq("id", user.id)
+      .maybeSingle();
+
+    const meObj = {
+      id: user.id,
+      email: user.email ?? null,
+      name: (p as any)?.name ?? null,
+      role: ((p as any)?.role ?? null) as Role | null,
+    };
+    setMe(meObj);
+    return meObj;
+  }
+
+  async function loadConversations() {
+    const { data, error } = await supabase
+      .from("conversations")
+      .select(
+        `
+        id,
+        last_message_at,
+        created_at,
+        customer:customers(id,name,grade,age,school_type),
+        owner:profiles!conversations_owner_user_id_fkey(id,name,role)
+      `
+      )
+      .order("last_message_at", { ascending: false });
+
+    if (error) throw error;
+
+    const rows = (data ?? []) as any as ConversationRow[];
+    setConversations(rows);
+    if (!selectedConversationId && rows.length > 0) setSelectedConversationId(rows[0].id);
+  }
+
+  async function loadMessages(conversationId: string) {
+    const { data, error } = await supabase
+      .from("messages")
+      .select(
+        `
+        id,
+        conversation_id,
+        sender_type,
+        sender_id,
+        content,
+        created_at,
+        sender:profiles(id,name)
+      `
+      )
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+    setMessages((data ?? []) as any);
+  }
+
+  async function loadInsightAndSuggestions(customerId: string, conversationId: string) {
+    const [{ data: iData, error: iErr }, { data: sData, error: sErr }] = await Promise.all([
+      supabase
+        .from("customer_insights")
+        .select("id,customer_id,emotion_score,engagement_level,historical_notes,tags")
+        .eq("customer_id", customerId)
+        .maybeSingle(),
+      supabase
+        .from("ai_suggestions")
+        .select("id,conversation_id,stage,suggestion_type,title,content,priority")
+        .eq("conversation_id", conversationId)
+        .order("priority", { ascending: true })
+        .order("created_at", { ascending: false }),
+    ]);
+
+    if (iErr) throw iErr;
+    if (sErr) throw sErr;
+
+    setInsight((iData ?? null) as any);
+    setSuggestions((sData ?? []) as any);
+  }
+
+  useEffect(() => {
+    (async () => {
+      await loadMe();
+      await loadConversations();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!selectedConversation?.id) return;
+
+    (async () => {
+      await loadMessages(selectedConversation.id);
+      if (selectedConversation.customer?.id) {
+        await loadInsightAndSuggestions(selectedConversation.customer.id, selectedConversation.id);
+      } else {
+        setInsight(null);
+        setSuggestions([]);
+      }
+      // scroll to bottom
+      setTimeout(() => listEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedConversation?.id]);
+
+  const canSendMessage = useMemo(() => {
+    if (!me?.id) return false;
+    if (!selectedConversation) return false;
+    if (me.role === "admin") return true;
+    if (me.role === "consultant") return selectedConversation.owner?.id === me.id;
+    return false;
+  }, [me, selectedConversation]);
+
+  const handleSync = async () => {
     setIsSyncing(true);
-    setTimeout(() => {
+    try {
+      await loadConversations();
+    } finally {
       setIsSyncing(false);
-      console.log("Synced latest WeChat conversations");
-    }, 1500);
+    }
   };
 
-  const handleManualSubmit = (e: React.FormEvent) => {
+  const handleManualSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const id = (customers.length + 1).toString();
-    const entry = {
-      id,
-      name: newCustomer.name,
-      school: `${newCustomer.schoolType} ${newCustomer.grade}`,
-      status: '待回复',
-      time: '刚刚',
-      risk: false,
-      grade: newCustomer.grade,
-      age: parseInt(newCustomer.age),
-      schoolType: newCustomer.schoolType,
-      source: 'Manual' as const,
-    };
-    
-    setCustomers([entry, ...customers]);
+    if (!me?.id) {
+      alert("请先登录");
+      return;
+    }
+    if (me.role !== "admin") {
+      alert("当前账号无权限创建客户（需要 Admin）。请用 admin@mykiwiedu.com 登录后创建。");
+      return;
+    }
+
+    const gradeNum = newCustomer.grade ? Number(newCustomer.grade) : null;
+    const ageNum = newCustomer.age ? Number(newCustomer.age) : null;
+
+    // 1) customers insert（RLS: admin 才能）
+    const { data: cust, error: e1 } = await supabase
+      .from("customers")
+      .insert({
+        name: newCustomer.name,
+        grade: Number.isFinite(gradeNum as any) ? gradeNum : null,
+        age: Number.isFinite(ageNum as any) ? ageNum : null,
+        school_type: newCustomer.schoolType || null,
+      })
+      .select("id")
+      .single();
+
+    if (e1) {
+      alert(e1.message);
+      return;
+    }
+
+    // 2) conversations insert（你当前策略：只有 admin ALL）
+    const { data: conv, error: e2 } = await supabase
+      .from("conversations")
+      .insert({
+        customer_id: cust.id,
+        owner_user_id: me.id,
+        last_message_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+
+    if (e2) {
+      alert(e2.message);
+      return;
+    }
+
+    // 3) 可选：把 history 作为一条“客户消息”写入 messages（如果你想保留导入备注）
+    if (newCustomer.history?.trim()) {
+      await supabase.from("messages").insert({
+        conversation_id: conv.id,
+        sender_type: "customer",
+        sender_id: null,
+        content: `【导入/备注】\n${newCustomer.history.trim()}`,
+      });
+    }
+
     setShowManualModal(false);
-    setNewCustomer({ name: '', grade: '', age: '', schoolType: '', history: '' });
-    setSelectedId(id);
+    setNewCustomer({ name: "", grade: "", age: "", schoolType: "", history: "" });
+
+    await loadConversations();
+    setSelectedConversationId(conv.id);
+  };
+
+  const handleSend = async () => {
+    if (!selectedConversation?.id) return;
+    if (!me?.id) return;
+    const text = messageInput.trim();
+    if (!text) return;
+
+    if (!canSendMessage) {
+      alert("无权限发送：顾问只能编辑自己的会话（admin 例外）。");
+      return;
+    }
+
+    setSending(true);
+    try {
+      const { error } = await supabase.from("messages").insert({
+        conversation_id: selectedConversation.id,
+        sender_type: "user",
+        sender_id: me.id,
+        content: text,
+      });
+      if (error) throw error;
+
+      setMessageInput("");
+      await loadMessages(selectedConversation.id);
+      setTimeout(() => listEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    } catch (err: any) {
+      alert(err?.message ?? "发送失败");
+    } finally {
+      setSending(false);
+    }
   };
 
   return (
@@ -82,7 +360,7 @@ const SalesWorkbench: React.FC = () => {
             <div className="p-6 border-b border-gray-50 flex justify-between items-center bg-gray-50/50">
               <h3 className="font-bold text-gray-900 flex items-center gap-2">
                 <UserPlus size={20} className="text-blue-600" />
-                手动录入客户
+                手动录入客户（Admin）
               </h3>
               <button onClick={() => setShowManualModal(false)} className="text-gray-400 hover:text-gray-600 p-1">
                 <X size={20} />
@@ -92,42 +370,42 @@ const SalesWorkbench: React.FC = () => {
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <label className="text-xs font-bold text-gray-500">客户姓名</label>
-                  <input 
+                  <input
                     required
                     value={newCustomer.name}
-                    onChange={e => setNewCustomer({...newCustomer, name: e.target.value})}
-                    type="text" 
-                    placeholder="请输入姓名" 
+                    onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })}
+                    type="text"
+                    placeholder="请输入姓名"
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                   />
                 </div>
                 <div className="space-y-1">
                   <label className="text-xs font-bold text-gray-500">年龄</label>
-                  <input 
+                  <input
                     value={newCustomer.age}
-                    onChange={e => setNewCustomer({...newCustomer, age: e.target.value})}
-                    type="number" 
-                    placeholder="请输入年龄" 
+                    onChange={(e) => setNewCustomer({ ...newCustomer, age: e.target.value })}
+                    type="number"
+                    placeholder="请输入年龄"
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                   />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
-                  <label className="text-xs font-bold text-gray-500">年级</label>
-                  <input 
+                  <label className="text-xs font-bold text-gray-500">年级（数字）</label>
+                  <input
                     value={newCustomer.grade}
-                    onChange={e => setNewCustomer({...newCustomer, grade: e.target.value})}
-                    type="text" 
-                    placeholder="如：高二 / 大一" 
+                    onChange={(e) => setNewCustomer({ ...newCustomer, grade: e.target.value })}
+                    type="number"
+                    placeholder="如：11"
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-xs font-bold text-gray-500">高中/学校类型</label>
-                  <select 
+                  <label className="text-xs font-bold text-gray-500">学校类型</label>
+                  <select
                     value={newCustomer.schoolType}
-                    onChange={e => setNewCustomer({...newCustomer, schoolType: e.target.value})}
+                    onChange={(e) => setNewCustomer({ ...newCustomer, schoolType: e.target.value })}
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                   >
                     <option value="">请选择</option>
@@ -141,22 +419,22 @@ const SalesWorkbench: React.FC = () => {
               </div>
               <div className="space-y-1">
                 <label className="text-xs font-bold text-gray-500">对话记录导入/备注</label>
-                <textarea 
+                <textarea
                   value={newCustomer.history}
-                  onChange={e => setNewCustomer({...newCustomer, history: e.target.value})}
-                  placeholder="手动录入关键对话信息或需求背景..." 
+                  onChange={(e) => setNewCustomer({ ...newCustomer, history: e.target.value })}
+                  placeholder="手动录入关键对话信息或需求背景..."
                   className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all h-32 resize-none"
                 />
               </div>
               <div className="pt-2 flex gap-3">
-                <button 
+                <button
                   type="button"
                   onClick={() => setShowManualModal(false)}
                   className="flex-1 py-3 border border-gray-200 text-gray-600 rounded-xl font-bold hover:bg-gray-50 transition-all"
                 >
                   取消
                 </button>
-                <button 
+                <button
                   type="submit"
                   className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 shadow-lg shadow-blue-100 transition-all"
                 >
@@ -168,216 +446,241 @@ const SalesWorkbench: React.FC = () => {
         </div>
       )}
 
-      {/* Left: Customer Stream */}
+      {/* Left: Conversation Stream */}
       <div className="col-span-3 bg-white rounded-2xl border border-gray-100 flex flex-col overflow-hidden shadow-sm">
         <div className="p-4 border-b border-gray-50 flex justify-between items-center bg-gray-50/30 shrink-0">
           <h3 className="font-bold text-gray-900 flex items-center gap-2">
-            会话列表 <span className="bg-blue-100 text-blue-600 text-[10px] px-1.5 py-0.5 rounded-full">{customers.length}</span>
+            会话列表{" "}
+            <span className="bg-blue-100 text-blue-600 text-[10px] px-1.5 py-0.5 rounded-full">
+              {conversations.length}
+            </span>
           </h3>
           <div className="flex gap-2">
-            <button 
-              onClick={handleSyncWeChat}
+            <button
+              onClick={handleSync}
               disabled={isSyncing}
-              title="同步企业微信会话"
-              className={`p-1.5 rounded-lg transition-colors ${isSyncing ? 'bg-gray-100 text-gray-400' : 'bg-green-50 text-green-600 hover:bg-green-100'}`}
+              title="刷新会话"
+              className={`p-1.5 rounded-lg transition-colors ${
+                isSyncing ? "bg-gray-100 text-gray-400" : "bg-green-50 text-green-600 hover:bg-green-100"
+              }`}
             >
-              <RefreshCw size={16} className={isSyncing ? 'animate-spin' : ''} />
+              <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
             </button>
-            <button 
+            <button
               onClick={() => setShowManualModal(true)}
-              title="手动录入新客户"
+              title="手动录入新客户（Admin）"
               className="p-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-colors"
             >
               <UserPlus size={16} />
             </button>
           </div>
         </div>
+
         <div className="flex-1 overflow-y-auto scrollbar-thin">
-          {customers.map(c => (
-            <div 
-              key={c.id} 
-              onClick={() => setSelectedId(c.id)}
-              className={`p-4 border-b border-gray-50 cursor-pointer transition-all ${
-                selectedId === c.id ? 'bg-blue-50/50 border-r-4 border-r-blue-600' : 'hover:bg-gray-50'
-              }`}
-            >
-              <div className="flex justify-between items-start mb-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-bold text-gray-900 text-sm">{c.name}</span>
-                  {c.source === 'Manual' && <span className="text-[8px] bg-gray-100 text-gray-400 px-1 py-0.5 rounded tracking-tighter uppercase font-bold">手动</span>}
+          {conversations.map((conv) => {
+            const c = conv.customer;
+            const name = c?.name ?? "未命名";
+            const time = timeLabel(conv.last_message_at ?? conv.created_at);
+            const school = schoolLabel(c);
+            const risk = false; // 你后面想做“待回复/超时风险”时再加逻辑
+
+            return (
+              <div
+                key={conv.id}
+                onClick={() => setSelectedConversationId(conv.id)}
+                className={`p-4 border-b border-gray-50 cursor-pointer transition-all ${
+                  selectedConversationId === conv.id ? "bg-blue-50/50 border-r-4 border-r-blue-600" : "hover:bg-gray-50"
+                }`}
+              >
+                <div className="flex justify-between items-start mb-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-gray-900 text-sm">{name}</span>
+                  </div>
+                  <span className="text-[10px] text-gray-400">{time}</span>
                 </div>
-                <span className="text-[10px] text-gray-400">{c.time}</span>
+                <div className="flex justify-between items-center">
+                  <span className="text-xs text-gray-500 truncate w-32">{school}</span>
+                  {risk && <Timer size={14} className="text-red-500 animate-pulse" />}
+                </div>
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-xs text-gray-500 truncate w-32">{c.school}</span>
-                {c.risk && <Timer size={14} className="text-red-500 animate-pulse" />}
-              </div>
-            </div>
-          ))}
-          {customers.length === 0 && (
+            );
+          })}
+
+          {conversations.length === 0 && (
             <div className="p-8 text-center">
-              <p className="text-sm text-gray-400">暂无客户记录</p>
+              <p className="text-sm text-gray-400">暂无会话</p>
             </div>
           )}
         </div>
       </div>
 
-      {/* Middle: Chat & AI Brain */}
-      <div className="col-span-6 flex flex-col gap-4 overflow-hidden">
-        {/* Chat Log (Simulated) */}
-        <div className="flex-1 bg-white rounded-2xl border border-gray-100 p-5 flex flex-col shadow-sm overflow-hidden">
-          <div className="flex items-center justify-between mb-4 border-b border-gray-50 pb-3 shrink-0">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 font-bold">
-                {selectedCustomer.name.charAt(0)}
-              </div>
-              <div>
-                <h4 className="font-bold text-gray-900">{selectedCustomer.name}</h4>
-                <p className="text-[10px] text-green-500 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></span> 
-                  {selectedCustomer.source === 'WeChat' ? '企微实时监听中' : '手动录入模式'}
-                </p>
-              </div>
+      {/* Middle: Chat */}
+      <div className="col-span-6 bg-white rounded-2xl border border-gray-100 flex flex-col overflow-hidden shadow-sm">
+        <div className="p-4 border-b border-gray-50 flex justify-between items-center bg-gray-50/30 shrink-0">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <MessageSquare size={18} className="text-blue-600" />
+              <h3 className="font-bold text-gray-900 truncate">
+                {selectedCustomer?.name ?? "未选择会话"}
+              </h3>
             </div>
-            <div className="flex items-center gap-1">
-              <button className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all"><PhoneCall size={18}/></button>
-              <button className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all"><ImageIcon size={18}/></button>
-              <button className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all"><MoreVertical size={18}/></button>
+            <div className="mt-1 text-xs text-gray-500 truncate">
+              {selectedCustomer ? `${schoolLabel(selectedCustomer)} · ${selectedCustomer.age ? `${selectedCustomer.age}岁` : ""}` : "请选择左侧会话"}
             </div>
           </div>
-          
-          <div className="flex-1 overflow-y-auto space-y-4 pr-2 scrollbar-thin">
-            {selectedCustomer.source === 'WeChat' ? (
+
+          <div className="flex items-center gap-2">
+            <button className="p-2 rounded-xl bg-white border border-gray-200 text-gray-500 hover:bg-gray-50" title="电话回访（占位）">
+              <PhoneCall size={16} />
+            </button>
+            <button className="p-2 rounded-xl bg-white border border-gray-200 text-gray-500 hover:bg-gray-50" title="导出（占位）">
+              <FileText size={16} />
+            </button>
+            <button className="p-2 rounded-xl bg-white border border-gray-200 text-gray-500 hover:bg-gray-50" title="更多">
+              <MoreVertical size={16} />
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {messages.map((m) => {
+            const isMe = m.sender_type === "user";
+            const label = isMe ? (m.sender?.name || me?.name || "我") : (selectedCustomer?.name || "客户");
+            return (
+              <div key={m.id} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+                  isMe ? "bg-blue-600 text-white" : "bg-gray-50 text-gray-900 border border-gray-100"
+                }`}>
+                  <div className={`text-[11px] mb-1 ${isMe ? "text-blue-100" : "text-gray-400"}`}>
+                    {label} · {timeLabel(m.created_at)}
+                  </div>
+                  <div className="whitespace-pre-wrap">{m.content}</div>
+                </div>
+              </div>
+            );
+          })}
+          <div ref={listEndRef} />
+        </div>
+
+        <div className="border-t border-gray-100 p-3 bg-white">
+          <div className="flex gap-2 items-end">
+            <textarea
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              placeholder={canSendMessage ? "输入回复…" : "无权限发送（顾问只能编辑自己的会话）"}
+              className="flex-1 resize-none rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+              rows={2}
+              disabled={!canSendMessage || sending || !selectedConversation}
+            />
+            <button
+              onClick={handleSend}
+              disabled={!canSendMessage || sending || !selectedConversation || !messageInput.trim()}
+              className={`h-11 px-4 rounded-2xl font-bold text-sm inline-flex items-center gap-2 ${
+                (!canSendMessage || sending || !selectedConversation || !messageInput.trim())
+                  ? "bg-gray-100 text-gray-400"
+                  : "bg-blue-600 text-white hover:bg-blue-700"
+              }`}
+              title="发送"
+            >
+              <Send size={16} />
+              发送
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Right: AI + Profile */}
+      <div className="col-span-3 bg-white rounded-2xl border border-gray-100 flex flex-col overflow-hidden shadow-sm">
+        <div className="p-4 border-b border-gray-50 bg-gray-50/30 shrink-0">
+          <h3 className="font-bold text-gray-900 flex items-center gap-2">
+            <Sparkles size={18} className="text-purple-600" />
+            AI & 客户画像
+          </h3>
+          <div className="mt-1 text-xs text-gray-500">
+            {selectedCustomer ? "根据当前会话生成建议" : "请选择会话查看"}
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {/* Insight */}
+          <div className="rounded-2xl border border-gray-100 bg-white p-4">
+            <div className="text-sm font-bold text-gray-900 mb-2">客户画像</div>
+            {!selectedCustomer ? (
+              <div className="text-sm text-gray-400">暂无数据</div>
+            ) : (
               <>
-                <div className="flex justify-start">
-                  <div className="bg-gray-100 p-3 rounded-2xl rounded-tl-none text-sm text-gray-800 max-w-[80%]">
-                    老师，我现在的背景想转学去南加大的商学院，希望大吗？
+                <div className="text-xs text-gray-500 mb-2">情绪分 / 参与度</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-2xl font-bold text-gray-900">{insight?.emotion_score ?? 50}</div>
+                  <div className="text-xs text-gray-500">
+                    {insight?.engagement_level ?? "medium"}
                   </div>
                 </div>
-                <div className="flex justify-end">
-                  <div className="bg-blue-600 p-3 rounded-2xl rounded-tr-none text-sm text-white max-w-[80%] shadow-lg shadow-blue-100">
-                    南加大(USC)的Marshall商学院非常欢迎有明确规划的转学生。你能先提供一下目前的GPA和已经修过的先修课程吗？
+
+                <div className="mt-3">
+                  <div className="text-xs text-gray-500 mb-1">标签</div>
+                  <div className="flex flex-wrap gap-2">
+                    {(Array.isArray(insight?.tags) ? insight?.tags : []).slice(0, 6).map((t: any, i: number) => (
+                      <span key={i} className="text-[11px] px-2 py-1 rounded-full bg-blue-50 text-blue-700">
+                        {String(t)}
+                      </span>
+                    ))}
+                    {(!insight?.tags || (Array.isArray(insight.tags) && insight.tags.length === 0)) && (
+                      <span className="text-[11px] text-gray-400">暂无</span>
+                    )}
                   </div>
                 </div>
               </>
+            )}
+          </div>
+
+          {/* Suggestions */}
+          <div className="rounded-2xl border border-gray-100 bg-white p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm font-bold text-gray-900">AI 建议</div>
+              <button className="text-xs text-gray-500 hover:text-gray-900 inline-flex items-center gap-1" onClick={async () => {
+                if (selectedConversation?.id && selectedCustomer?.id) {
+                  await loadInsightAndSuggestions(selectedCustomer.id, selectedConversation.id);
+                }
+              }}>
+                <RefreshCw size={14} />
+                刷新
+              </button>
+            </div>
+
+            {suggestions.length === 0 ? (
+              <div className="text-sm text-gray-400">暂无建议</div>
             ) : (
-              <div className="flex flex-col items-center justify-center h-full text-center p-8 bg-gray-50/50 rounded-3xl border border-dashed border-gray-200">
-                <MessageSquare className="text-gray-300 mb-3" size={32} />
-                <p className="text-sm text-gray-500 font-medium">手动录入客户会话</p>
-                <p className="text-xs text-gray-400 mt-1">您可以手动记录对话概要，AI将基于此提供建议</p>
-                <button className="mt-4 text-xs bg-white border border-gray-200 px-4 py-2 rounded-xl text-gray-600 hover:border-blue-500 hover:text-blue-600 transition-all">
-                  添加对话摘要
-                </button>
+              <div className="space-y-3">
+                {suggestions.slice(0, 5).map((s) => (
+                  <div key={s.id} className="rounded-2xl border border-gray-100 p-3 bg-gray-50/40">
+                    <div className="text-xs text-gray-500 mb-1">
+                      {s.stage} · {s.suggestion_type}
+                    </div>
+                    <div className="text-sm font-bold text-gray-900">{s.title}</div>
+                    <div className="mt-1 text-sm text-gray-700 whitespace-pre-wrap">{s.content}</div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
 
-          <div className="mt-3 pt-3 border-t border-gray-50 shrink-0">
-            <div className="bg-blue-50/50 p-3 rounded-xl border border-blue-100 mb-3 animate-in slide-in-from-bottom-2">
-              <div className="flex items-center gap-2 text-blue-700 font-bold text-[10px] mb-1.5">
-                <Sparkles size={14} /> AI 决策层建议
-              </div>
-              <p className="text-[11px] text-blue-800 leading-relaxed mb-2">
-                检测到客户处于「决策关键期」。建议：发送 11月 Marshall 商学院转学成功案例包，引导客户签署《初步评估表》。
-              </p>
-              <div className="flex gap-2">
-                <button className="text-[9px] px-2 py-1 bg-white border border-blue-200 rounded-md hover:bg-blue-100 transition-colors font-medium">话术：侧面引导</button>
-                <button className="text-[9px] px-2 py-1 bg-white border border-blue-200 rounded-md hover:bg-blue-100 transition-colors font-medium">素材：USC案例</button>
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <textarea placeholder="输入回复或使用AI建议..." className="flex-1 bg-gray-50 border-none rounded-xl p-3 text-sm focus:ring-1 focus:ring-blue-500 h-11 resize-none" />
-              <button className="bg-blue-600 text-white px-4 rounded-xl hover:bg-blue-700 transition-all shadow-md font-bold text-sm">发送</button>
+          {/* Quick links (占位) */}
+          <div className="rounded-2xl border border-gray-100 bg-white p-4">
+            <div className="text-sm font-bold text-gray-900 mb-2">快捷操作</div>
+            <div className="grid grid-cols-2 gap-2">
+              <button className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 inline-flex items-center gap-2">
+                <ExternalLink size={14} />
+                打开资料
+              </button>
+              <button className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 inline-flex items-center gap-2">
+                <FileText size={14} />
+                导出记录
+              </button>
             </div>
           </div>
-        </div>
-
-        {/* Action Quick Bar */}
-        <div className="grid grid-cols-3 gap-3 shrink-0">
-          <button className="bg-white p-3 rounded-2xl border border-gray-100 flex flex-col items-center gap-1.5 hover:border-blue-500 transition-all group shadow-sm">
-            <div className="p-1.5 bg-purple-50 text-purple-600 rounded-lg group-hover:bg-purple-600 group-hover:text-white transition-all"><ImageIcon size={18}/></div>
-            <span className="text-[10px] font-bold text-gray-700">生成朋友圈图</span>
-          </button>
-          <button className="bg-white p-3 rounded-2xl border border-gray-100 flex flex-col items-center gap-1.5 hover:border-blue-500 transition-all group shadow-sm">
-            <div className="p-1.5 bg-orange-50 text-orange-600 rounded-lg group-hover:bg-orange-600 group-hover:text-white transition-all"><FileText size={18}/></div>
-            <span className="text-[10px] font-bold text-gray-700">生成预签合同</span>
-          </button>
-          <button className="bg-white p-3 rounded-2xl border border-gray-100 flex flex-col items-center gap-1.5 hover:border-blue-500 transition-all group shadow-sm">
-            <div className="p-1.5 bg-green-50 text-green-600 rounded-lg group-hover:bg-green-600 group-hover:text-white transition-all"><ExternalLink size={18}/></div>
-            <span className="text-[10px] font-bold text-gray-700">跳转简道云CRM</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Right: User Persona & Learning Layer */}
-      <div className="col-span-3 flex flex-col gap-4 overflow-hidden">
-        <div className="flex-1 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm overflow-hidden flex flex-col">
-          <h3 className="font-bold text-gray-900 mb-4 flex items-center gap-2 shrink-0"><History size={16}/> 用户画像</h3>
-          <div className="flex-1 overflow-y-auto space-y-4 pr-1 scrollbar-thin">
-            <div className="p-3 bg-gray-50 rounded-xl">
-              <p className="text-[9px] text-gray-400 uppercase font-bold tracking-wider mb-2">关键信息</p>
-              <div className="grid grid-cols-2 gap-3">
-                <div><p className="text-[9px] text-gray-500">添加日期</p><p className="text-xs font-bold">2023.10.20</p></div>
-                <div><p className="text-[9px] text-gray-500">交互员工</p><p className="text-xs font-bold text-blue-600">Kate, Lin</p></div>
-              </div>
-            </div>
-            
-            <div className="space-y-2">
-              <p className="text-[9px] text-gray-400 uppercase font-bold tracking-wider">背景档案</p>
-              <div className="bg-gray-50 p-3 rounded-xl space-y-2">
-                <div className="flex justify-between items-center">
-                  <span className="text-[10px] text-gray-500">年级</span>
-                  <span className="text-xs font-bold">{selectedCustomer.grade || '未完善'}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-[10px] text-gray-500">年龄</span>
-                  <span className="text-xs font-bold">{selectedCustomer.age || '未完善'}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-[10px] text-gray-500">学校类型</span>
-                  <span className="text-xs font-bold">{selectedCustomer.schoolType || '未完善'}</span>
-                </div>
-              </div>
-            </div>
-
-            <div className="p-3 bg-blue-50/30 rounded-xl border border-blue-50">
-              <p className="text-[9px] text-blue-500 uppercase font-bold tracking-wider mb-2">情绪监测</p>
-              <div className="flex gap-1 mb-2">
-                <div className="h-1 flex-1 bg-green-400 rounded-full"></div>
-                <div className="h-1 flex-1 bg-green-400 rounded-full"></div>
-                <div className="h-1 flex-1 bg-gray-200 rounded-full"></div>
-                <div className="h-1 flex-1 bg-gray-200 rounded-full"></div>
-              </div>
-              <p className="text-[10px] text-green-600 font-medium">偏向积极：对案例反馈强烈</p>
-            </div>
-            
-            <div className="space-y-2">
-              <p className="text-[9px] text-gray-400 uppercase font-bold tracking-wider">历史足迹</p>
-              {[
-                { event: '查看了 2024转学白皮书', date: '2h前' },
-                { event: '视频号咨询转学GPA', date: '1天前' },
-              ].map((h, i) => (
-                <div key={i} className="flex gap-2 text-[11px] border-l-2 border-gray-100 pl-3 pb-3">
-                  <span className="text-gray-900 leading-tight flex-1">{h.event}</span>
-                  <span className="text-gray-400 text-[9px] whitespace-nowrap">{h.date}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-gradient-to-br from-blue-600 to-indigo-700 rounded-2xl p-5 text-white shadow-lg shrink-0">
-          <h3 className="font-bold text-xs mb-2 flex items-center gap-2"><Sparkles size={16}/> 学习层分析</h3>
-          <p className="text-[11px] text-blue-100 leading-relaxed mb-4">
-            针对「{selectedCustomer.schoolType || '留学'}」客户，建议在对话中提及「11年级选课策略」。
-          </p>
-          <button className="w-full py-2.5 bg-white/20 hover:bg-white/30 rounded-xl text-[11px] font-black backdrop-blur-sm transition-all border border-white/10 shadow-sm">
-            查看针对性 SOP
-          </button>
         </div>
       </div>
     </div>
   );
-};
-
-export default SalesWorkbench;
+}
