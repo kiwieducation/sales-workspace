@@ -53,3 +53,9 @@ body {
 .message-bubble {
   animation: slideIn 0.2s ease-out;
 }
+
+/* Recharts: avoid 0x0 container warnings in ResponsiveContainer */
+.recharts-responsive-container {
+  min-height: 240px;
+  min-width: 0;
+}
