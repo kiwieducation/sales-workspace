@@ -4,7 +4,7 @@ import { Sparkles } from 'lucide-react'
 import { AISuggestion } from '@/lib/types'
 
 interface AISuggestionCardProps {
-  suggestion?: AISuggestion
+  suggestion?: AISuggestion | null
 }
 
 export default function AISuggestionCard({ suggestion }: AISuggestionCardProps) {

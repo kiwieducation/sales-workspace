@@ -5,7 +5,7 @@ import { TrendingUp, X } from 'lucide-react'
 import { Customer } from '@/lib/types'
 
 interface LearningAnalysisCardProps {
-  customer?: Customer
+  customer?: Customer | null
 }
 
 export default function LearningAnalysisCard({ customer }: LearningAnalysisCardProps) {

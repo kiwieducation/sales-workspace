@@ -85,6 +85,8 @@ export default function SalesWorkspacePage() {
     if (!selectedConversation) return
 
     async function loadMessages() {
+      if (!selectedConversation) return // TypeScript null check
+      
       const { data, error } = await supabase
         .from('messages')
         .select(`
@@ -110,6 +112,8 @@ export default function SalesWorkspacePage() {
     if (!selectedConversation?.customer_id) return
 
     async function loadInsight() {
+      if (!selectedConversation?.customer_id) return // TypeScript null check
+      
       const { data, error } = await supabase
         .from('customer_insights')
         .select('*')
@@ -132,6 +136,8 @@ export default function SalesWorkspacePage() {
     if (!selectedConversation?.id) return
 
     async function loadSuggestion() {
+      if (!selectedConversation?.id) return // TypeScript null check
+      
       const { data, error } = await supabase
         .from('ai_suggestions')
         .select('*')
@@ -154,11 +160,15 @@ export default function SalesWorkspacePage() {
   const handleSendMessage = async (content: string) => {
     if (!selectedConversation || !currentUser) return
 
+    // 保存引用，避免 TypeScript 空值检查问题
+    const conversationId = selectedConversation.id
+    const userId = currentUser.id
+
     // 插入消息
     const { error } = await supabase.from('messages').insert({
-      conversation_id: selectedConversation.id,
+      conversation_id: conversationId,
       sender_type: 'user',
-      sender_id: currentUser.id,
+      sender_id: userId,
       content,
     })
 
@@ -174,7 +184,7 @@ export default function SalesWorkspacePage() {
         *,
         sender:profiles(*)
       `)
-      .eq('conversation_id', selectedConversation.id)
+      .eq('conversation_id', conversationId)
       .order('created_at', { ascending: true })
 
     if (data) {

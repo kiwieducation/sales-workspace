@@ -4,8 +4,8 @@ import { Customer, CustomerInsight } from '@/lib/types'
 import { Calendar } from 'lucide-react'
 
 interface UserProfilePanelProps {
-  customer?: Customer
-  insight?: CustomerInsight
+  customer?: Customer | null
+  insight?: CustomerInsight | null
   ownerName?: string
 }
 

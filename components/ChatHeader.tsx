@@ -4,7 +4,7 @@ import { Phone, Image, MoreVertical } from 'lucide-react'
 import { Customer } from '@/lib/types'
 
 interface ChatHeaderProps {
-  customer?: Customer
+  customer?: Customer | null
   status?: string
 }
 
