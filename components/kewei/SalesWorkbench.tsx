@@ -1,4 +1,3 @@
-
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -7,34 +6,38 @@ import {
   UserPlus,
   Timer,
   Sparkles,
-  PhoneCall,
-  FileText,
-  ExternalLink,
-  MoreVertical,
   RefreshCw,
   X,
   Send,
+  ExternalLink,
+  FileText,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
 type Role = "admin" | "consultant" | "viewer";
 
+type ProfileRow = {
+  id: string;
+  name: string;
+  role: Role;
+  avatar_url?: string | null;
+};
+
+type CustomerRow = {
+  id: string;
+  name: string;
+  grade: number | null;
+  age: number | null;
+  school_type: string | null;
+};
+
 type ConversationRow = {
   id: string;
+  customer_id: string;
+  owner_user_id: string;
   last_message_at: string | null;
-  created_at: string | null;
-  customer: {
-    id: string;
-    name: string;
-    grade: number | null;
-    age: number | null;
-    school_type: string | null;
-  } | null;
-  owner: {
-    id: string;
-    name: string | null;
-    role: Role | null;
-  } | null;
+  created_at?: string | null;
+  customers?: CustomerRow | null; // joined
 };
 
 type MessageRow = {
@@ -44,19 +47,20 @@ type MessageRow = {
   sender_id: string | null;
   content: string;
   created_at: string;
-  sender: { id: string; name: string | null } | null;
+  sender?: ProfileRow | null; // joined
 };
 
-type InsightRow = {
+type CustomerInsightRow = {
   id: string;
   customer_id: string;
   emotion_score: number | null;
   engagement_level: string | null;
   historical_notes: any;
   tags: any;
+  updated_at: string | null;
 };
 
-type SuggestionRow = {
+type AISuggestionRow = {
   id: string;
   conversation_id: string;
   stage: string;
@@ -64,60 +68,77 @@ type SuggestionRow = {
   title: string;
   content: string;
   priority: number | null;
+  updated_at: string | null;
 };
 
-function timeLabel(iso?: string | null) {
-  if (!iso) return "";
-  const t = new Date(iso).getTime();
-  const diff = Date.now() - t;
-  const m = Math.floor(diff / 60000);
-  if (m < 1) return "刚刚";
-  if (m < 60) return `${m}分钟前`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}小时前`;
-  const d = Math.floor(h / 24);
-  return `${d}天前`;
+function cn(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
 }
 
-function schoolLabel(c: ConversationRow["customer"]) {
-  if (!c) return "";
+function timeAgo(input: string | null | undefined) {
+  if (!input) return "—";
+  const d = new Date(input);
+  const diff = Date.now() - d.getTime();
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return "刚刚";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}小时前`;
+  const day = Math.floor(hr / 24);
+  return `${day}天前`;
+}
+
+function schoolLabel(c: CustomerRow | null | undefined) {
+  if (!c) return "—";
   const parts: string[] = [];
   if (c.school_type) parts.push(c.school_type);
   if (c.grade !== null && c.grade !== undefined) parts.push(`${c.grade}年级`);
-  if (!parts.length) return "";
-  return parts.join(" ");
+  return parts.length ? parts.join(" ") : "—";
+}
+
+function safeJsonArray(v: any): any[] {
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  try {
+    const parsed = typeof v === "string" ? JSON.parse(v) : v;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export default function SalesWorkbench() {
   const supabase = useMemo(() => createClient(), []);
 
-  // auth/profile
-  const [me, setMe] = useState<{ id: string; email: string | null; role: Role | null; name: string | null } | null>(null);
+  const [booting, setBooting] = useState(true);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [currentProfile, setCurrentProfile] = useState<ProfileRow | null>(null);
 
-  // conversations
   const [conversations, setConversations] = useState<ConversationRow[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+
   const selectedConversation = useMemo(
-    () => conversations.find((c) => c.id === selectedConversationId) || conversations[0] || null,
+    () => conversations.find((c) => c.id === selectedConversationId) || null,
     [conversations, selectedConversationId]
   );
-  const selectedCustomer = selectedConversation?.customer || null;
+  const selectedCustomer = selectedConversation?.customers || null;
 
-  // messages
   const [messages, setMessages] = useState<MessageRow[]>([]);
-  const [messageInput, setMessageInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const listEndRef = useRef<HTMLDivElement>(null);
+  const [loadingMessages, setLoadingMessages] = useState(false);
 
-  // right panel
-  const [insight, setInsight] = useState<InsightRow | null>(null);
-  const [suggestions, setSuggestions] = useState<SuggestionRow[]>([]);
+  const [insight, setInsight] = useState<CustomerInsightRow | null>(null);
+  const [suggestion, setSuggestion] = useState<AISuggestionRow | null>(null);
 
-  // ui
   const [isSyncing, setIsSyncing] = useState(false);
-  const [showManualModal, setShowManualModal] = useState(false);
 
-  // Manual Form State
+  const [composer, setComposer] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  // Manual modal (先保留 UI：仅 admin 可用，避免 RLS 失败)
+  const [showManualModal, setShowManualModal] = useState(false);
   const [newCustomer, setNewCustomer] = useState({
     name: "",
     grade: "",
@@ -126,28 +147,46 @@ export default function SalesWorkbench() {
     history: "",
   });
 
-  async function loadMe() {
-    const { data } = await supabase.auth.getUser();
-    const user = data.user;
-    if (!user) {
-      setMe(null);
-      return null;
+  function canCreateCustomer() {
+    return currentProfile?.role === "admin";
+  }
+  function canSendMessage() {
+    if (!currentProfile || !selectedConversation) return false;
+    if (currentProfile.role === "admin") return true;
+    if (currentProfile.role === "consultant") {
+      return selectedConversation.owner_user_id === currentProfile.id;
     }
+    return false;
+  }
 
-    const { data: p } = await supabase
+  async function loadSessionAndProfile() {
+    const { data: authData, error } = await supabase.auth.getUser();
+    if (error) {
+      console.error("auth.getUser error:", error);
+      setCurrentUserId(null);
+      setCurrentProfile(null);
+      return;
+    }
+    const user = authData.user;
+    if (!user) {
+      setCurrentUserId(null);
+      setCurrentProfile(null);
+      return;
+    }
+    setCurrentUserId(user.id);
+
+    const { data: prof, error: profErr } = await supabase
       .from("profiles")
-      .select("id,name,role")
+      .select("id,name,role,avatar_url")
       .eq("id", user.id)
       .maybeSingle();
 
-    const meObj = {
-      id: user.id,
-      email: user.email ?? null,
-      name: (p as any)?.name ?? null,
-      role: ((p as any)?.role ?? null) as Role | null,
-    };
-    setMe(meObj);
-    return meObj;
+    if (profErr) {
+      console.error("load profile error:", profErr);
+      setCurrentProfile(null);
+      return;
+    }
+    setCurrentProfile((prof as any) || null);
   }
 
   async function loadConversations() {
@@ -156,200 +195,262 @@ export default function SalesWorkbench() {
       .select(
         `
         id,
+        customer_id,
+        owner_user_id,
         last_message_at,
         created_at,
-        customer:customers(id,name,grade,age,school_type),
-        owner:profiles!conversations_owner_user_id_fkey(id,name,role)
+        customers:customer_id (
+          id,
+          name,
+          grade,
+          age,
+          school_type
+        )
       `
       )
-      .order("last_message_at", { ascending: false });
+      .order("last_message_at", { ascending: false })
+      .limit(50);
 
-    if (error) throw error;
+    if (error) {
+      console.error("load conversations error:", error);
+      setConversations([]);
+      setSelectedConversationId(null);
+      return;
+    }
 
-    const rows = (data ?? []) as any as ConversationRow[];
+    const rows = (data as any as ConversationRow[]) || [];
     setConversations(rows);
-    if (!selectedConversationId && rows.length > 0) setSelectedConversationId(rows[0].id);
+    if (!selectedConversationId && rows.length > 0) {
+      setSelectedConversationId(rows[0].id);
+    } else if (selectedConversationId && !rows.find((r) => r.id === selectedConversationId)) {
+      setSelectedConversationId(rows[0]?.id || null);
+    }
   }
 
   async function loadMessages(conversationId: string) {
-    const { data, error } = await supabase
-      .from("messages")
-      .select(
+    setLoadingMessages(true);
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .select(
+          `
+          id,
+          conversation_id,
+          sender_type,
+          sender_id,
+          content,
+          created_at,
+          sender:sender_id (
+            id,
+            name,
+            role,
+            avatar_url
+          )
         `
-        id,
-        conversation_id,
-        sender_type,
-        sender_id,
-        content,
-        created_at,
-        sender:profiles(id,name)
-      `
-      )
-      .eq("conversation_id", conversationId)
-      .order("created_at", { ascending: true });
-
-    if (error) throw error;
-    setMessages((data ?? []) as any);
-  }
-
-  async function loadInsightAndSuggestions(customerId: string, conversationId: string) {
-    const [{ data: iData, error: iErr }, { data: sData, error: sErr }] = await Promise.all([
-      supabase
-        .from("customer_insights")
-        .select("id,customer_id,emotion_score,engagement_level,historical_notes,tags")
-        .eq("customer_id", customerId)
-        .maybeSingle(),
-      supabase
-        .from("ai_suggestions")
-        .select("id,conversation_id,stage,suggestion_type,title,content,priority")
+        )
         .eq("conversation_id", conversationId)
-        .order("priority", { ascending: true })
-        .order("created_at", { ascending: false }),
-    ]);
+        .order("created_at", { ascending: true })
+        .limit(300);
 
-    if (iErr) throw iErr;
-    if (sErr) throw sErr;
-
-    setInsight((iData ?? null) as any);
-    setSuggestions((sData ?? []) as any);
+      if (error) {
+        console.error("load messages error:", error);
+        setMessages([]);
+        return;
+      }
+      setMessages(((data as any) || []) as MessageRow[]);
+      // scroll to bottom
+      setTimeout(() => {
+        listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+      }, 50);
+    } finally {
+      setLoadingMessages(false);
+    }
   }
 
-  useEffect(() => {
-    (async () => {
-      await loadMe();
-      await loadConversations();
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  async function loadInsight(customerId: string) {
+    const { data, error } = await supabase
+      .from("customer_insights")
+      .select("id,customer_id,emotion_score,engagement_level,historical_notes,tags,updated_at")
+      .eq("customer_id", customerId)
+      .maybeSingle();
 
-  useEffect(() => {
-    if (!selectedConversation?.id) return;
+    if (error) {
+      console.error("load insight error:", error);
+      setInsight(null);
+      return;
+    }
+    setInsight((data as any) || null);
+  }
 
-    (async () => {
-      await loadMessages(selectedConversation.id);
-      if (selectedConversation.customer?.id) {
-        await loadInsightAndSuggestions(selectedConversation.customer.id, selectedConversation.id);
-      } else {
-        setInsight(null);
-        setSuggestions([]);
+  async function loadSuggestion(conversationId: string) {
+    const { data, error } = await supabase
+      .from("ai_suggestions")
+      .select("id,conversation_id,stage,suggestion_type,title,content,priority,updated_at")
+      .eq("conversation_id", conversationId)
+      .order("updated_at", { ascending: false })
+      .limit(1);
+
+    if (error) {
+      console.error("load suggestion error:", error);
+      setSuggestion(null);
+      return;
+    }
+    setSuggestion(((data as any) || [])[0] || null);
+  }
+
+  async function handleSend() {
+    const text = composer.trim();
+    if (!text || !selectedConversation || !currentProfile) return;
+    if (!canSendMessage()) return;
+
+    setSending(true);
+    try {
+      const tempId = `tmp-${Date.now()}`;
+      const optimistic: MessageRow = {
+        id: tempId,
+        conversation_id: selectedConversation.id,
+        sender_type: "user",
+        sender_id: currentProfile.id,
+        content: text,
+        created_at: new Date().toISOString(),
+        sender: currentProfile,
+      };
+      setMessages((prev) => [...prev, optimistic]);
+      setComposer("");
+      setTimeout(() => {
+        listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+      }, 50);
+
+      const { error } = await supabase.from("messages").insert({
+        conversation_id: selectedConversation.id,
+        sender_type: "user",
+        sender_id: currentProfile.id,
+        content: text,
+      });
+
+      if (error) {
+        console.error("send message error:", error);
+        // rollback optimistic
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
+        setComposer(text);
+        return;
       }
-      // scroll to bottom
-      setTimeout(() => listEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedConversation?.id]);
 
-  const canSendMessage = useMemo(() => {
-    if (!me?.id) return false;
-    if (!selectedConversation) return false;
-    if (me.role === "admin") return true;
-    if (me.role === "consultant") return selectedConversation.owner?.id === me.id;
-    return false;
-  }, [me, selectedConversation]);
+      // refresh conversation list for last_message_at ordering
+      await loadConversations();
+      // reload messages from server (确保 id / created_at 正确)
+      await loadMessages(selectedConversation.id);
+      await loadSuggestion(selectedConversation.id);
+    } finally {
+      setSending(false);
+    }
+  }
 
-  const handleSync = async () => {
+  async function handleSync() {
+    // 占位：未来接企微同步；现在保持按钮体验
     setIsSyncing(true);
     try {
       await loadConversations();
     } finally {
-      setIsSyncing(false);
+      setTimeout(() => setIsSyncing(false), 600);
     }
-  };
+  }
 
-  const handleManualSubmit = async (e: React.FormEvent) => {
+  async function handleManualSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!me?.id) {
-      alert("请先登录");
-      return;
-    }
-    if (me.role !== "admin") {
-      alert("当前账号无权限创建客户（需要 Admin）。请用 admin@mykiwiedu.com 登录后创建。");
-      return;
-    }
+    if (!canCreateCustomer()) return;
 
-    const gradeNum = newCustomer.grade ? Number(newCustomer.grade) : null;
-    const ageNum = newCustomer.age ? Number(newCustomer.age) : null;
+    const name = newCustomer.name.trim();
+    if (!name) return;
 
-    // 1) customers insert（RLS: admin 才能）
-    const { data: cust, error: e1 } = await supabase
+    const gradeNum = newCustomer.grade.trim() ? Number(newCustomer.grade.trim()) : null;
+    const ageNum = newCustomer.age.trim() ? Number(newCustomer.age.trim()) : null;
+
+    // 1) create customer
+    const { data: cust, error: custErr } = await supabase
       .from("customers")
       .insert({
-        name: newCustomer.name,
+        name,
         grade: Number.isFinite(gradeNum as any) ? gradeNum : null,
         age: Number.isFinite(ageNum as any) ? ageNum : null,
         school_type: newCustomer.schoolType || null,
       })
-      .select("id")
+      .select("id,name,grade,age,school_type")
       .single();
 
-    if (e1) {
-      alert(e1.message);
+    if (custErr) {
+      console.error("create customer error:", custErr);
       return;
     }
 
-    // 2) conversations insert（你当前策略：只有 admin ALL）
-    const { data: conv, error: e2 } = await supabase
+    // 2) create conversation owned by current user
+    const { data: conv, error: convErr } = await supabase
       .from("conversations")
       .insert({
-        customer_id: cust.id,
-        owner_user_id: me.id,
-        last_message_at: new Date().toISOString(),
+        customer_id: (cust as any).id,
+        owner_user_id: currentProfile?.id,
       })
-      .select("id")
+      .select(
+        `
+        id,
+        customer_id,
+        owner_user_id,
+        last_message_at,
+        created_at,
+        customers:customer_id (id,name,grade,age,school_type)
+      `
+      )
       .single();
 
-    if (e2) {
-      alert(e2.message);
+    if (convErr) {
+      console.error("create conversation error:", convErr);
       return;
     }
 
-    // 3) 可选：把 history 作为一条“客户消息”写入 messages（如果你想保留导入备注）
-    if (newCustomer.history?.trim()) {
-      await supabase.from("messages").insert({
-        conversation_id: conv.id,
+    // 3) optional: seed a "customer" message from history
+    const history = newCustomer.history.trim();
+    if (history) {
+      const { error: msgErr } = await supabase.from("messages").insert({
+        conversation_id: (conv as any).id,
         sender_type: "customer",
         sender_id: null,
-        content: `【导入/备注】\n${newCustomer.history.trim()}`,
+        content: history,
       });
+      if (msgErr) console.error("seed history msg error:", msgErr);
     }
 
     setShowManualModal(false);
     setNewCustomer({ name: "", grade: "", age: "", schoolType: "", history: "" });
 
     await loadConversations();
-    setSelectedConversationId(conv.id);
-  };
+    setSelectedConversationId((conv as any).id);
+  }
 
-  const handleSend = async () => {
-    if (!selectedConversation?.id) return;
-    if (!me?.id) return;
-    const text = messageInput.trim();
-    if (!text) return;
+  // boot
+  useEffect(() => {
+    (async () => {
+      setBooting(true);
+      await loadSessionAndProfile();
+      await loadConversations();
+      setBooting(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    if (!canSendMessage) {
-      alert("无权限发送：顾问只能编辑自己的会话（admin 例外）。");
-      return;
-    }
+  // when selection changes -> load messages + insight + suggestion
+  useEffect(() => {
+    if (!selectedConversationId) return;
+    (async () => {
+      await loadMessages(selectedConversationId);
+      const conv = conversations.find((c) => c.id === selectedConversationId) || null;
+      const customerId = conv?.customer_id;
+      if (customerId) await loadInsight(customerId);
+      await loadSuggestion(selectedConversationId);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedConversationId]);
 
-    setSending(true);
-    try {
-      const { error } = await supabase.from("messages").insert({
-        conversation_id: selectedConversation.id,
-        sender_type: "user",
-        sender_id: me.id,
-        content: text,
-      });
-      if (error) throw error;
-
-      setMessageInput("");
-      await loadMessages(selectedConversation.id);
-      setTimeout(() => listEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
-    } catch (err: any) {
-      alert(err?.message ?? "发送失败");
-    } finally {
-      setSending(false);
-    }
-  };
+  const convoCount = conversations.length;
 
   return (
     <div className="grid grid-cols-12 gap-6 h-[calc(100vh-10rem)] relative overflow-hidden">
@@ -360,13 +461,18 @@ export default function SalesWorkbench() {
             <div className="p-6 border-b border-gray-50 flex justify-between items-center bg-gray-50/50">
               <h3 className="font-bold text-gray-900 flex items-center gap-2">
                 <UserPlus size={20} className="text-blue-600" />
-                手动录入客户（Admin）
+                手动录入客户
               </h3>
               <button onClick={() => setShowManualModal(false)} className="text-gray-400 hover:text-gray-600 p-1">
                 <X size={20} />
               </button>
             </div>
             <form onSubmit={handleManualSubmit} className="p-6 space-y-4">
+              {!canCreateCustomer() && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700">
+                  当前账号角色为 <b>{currentProfile?.role || "未知"}</b>，按现有 RLS 规则仅 <b>admin</b> 可新建客户/会话。
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <label className="text-xs font-bold text-gray-500">客户姓名</label>
@@ -377,6 +483,7 @@ export default function SalesWorkbench() {
                     type="text"
                     placeholder="请输入姓名"
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    disabled={!canCreateCustomer()}
                   />
                 </div>
                 <div className="space-y-1">
@@ -387,26 +494,29 @@ export default function SalesWorkbench() {
                     type="number"
                     placeholder="请输入年龄"
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    disabled={!canCreateCustomer()}
                   />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
-                  <label className="text-xs font-bold text-gray-500">年级（数字）</label>
+                  <label className="text-xs font-bold text-gray-500">年级</label>
                   <input
                     value={newCustomer.grade}
                     onChange={(e) => setNewCustomer({ ...newCustomer, grade: e.target.value })}
-                    type="number"
+                    type="text"
                     placeholder="如：11"
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    disabled={!canCreateCustomer()}
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-xs font-bold text-gray-500">学校类型</label>
+                  <label className="text-xs font-bold text-gray-500">高中/学校类型</label>
                   <select
                     value={newCustomer.schoolType}
                     onChange={(e) => setNewCustomer({ ...newCustomer, schoolType: e.target.value })}
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    disabled={!canCreateCustomer()}
                   >
                     <option value="">请选择</option>
                     <option value="公办高中">公办高中</option>
@@ -424,6 +534,7 @@ export default function SalesWorkbench() {
                   onChange={(e) => setNewCustomer({ ...newCustomer, history: e.target.value })}
                   placeholder="手动录入关键对话信息或需求背景..."
                   className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all h-32 resize-none"
+                  disabled={!canCreateCustomer()}
                 />
               </div>
               <div className="pt-2 flex gap-3">
@@ -436,7 +547,11 @@ export default function SalesWorkbench() {
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 shadow-lg shadow-blue-100 transition-all"
+                  disabled={!canCreateCustomer()}
+                  className={cn(
+                    "flex-1 py-3 rounded-xl font-bold shadow-lg transition-all",
+                    canCreateCustomer() ? "bg-blue-600 text-white hover:bg-blue-700 shadow-blue-100" : "bg-gray-200 text-gray-500 shadow-none cursor-not-allowed"
+                  )}
                 >
                   保存并跟进
                 </button>
@@ -446,13 +561,13 @@ export default function SalesWorkbench() {
         </div>
       )}
 
-      {/* Left: Conversation Stream */}
+      {/* Left: Conversation List */}
       <div className="col-span-3 bg-white rounded-2xl border border-gray-100 flex flex-col overflow-hidden shadow-sm">
         <div className="p-4 border-b border-gray-50 flex justify-between items-center bg-gray-50/30 shrink-0">
           <h3 className="font-bold text-gray-900 flex items-center gap-2">
             会话列表{" "}
             <span className="bg-blue-100 text-blue-600 text-[10px] px-1.5 py-0.5 rounded-full">
-              {conversations.length}
+              {convoCount}
             </span>
           </h3>
           <div className="flex gap-2">
@@ -460,16 +575,21 @@ export default function SalesWorkbench() {
               onClick={handleSync}
               disabled={isSyncing}
               title="刷新会话"
-              className={`p-1.5 rounded-lg transition-colors ${
+              className={cn(
+                "p-1.5 rounded-lg transition-colors",
                 isSyncing ? "bg-gray-100 text-gray-400" : "bg-green-50 text-green-600 hover:bg-green-100"
-              }`}
+              )}
             >
               <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
             </button>
             <button
               onClick={() => setShowManualModal(true)}
-              title="手动录入新客户（Admin）"
-              className="p-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-colors"
+              title={canCreateCustomer() ? "手动录入新客户" : "仅 admin 可新建"}
+              className={cn(
+                "p-1.5 rounded-lg transition-colors",
+                canCreateCustomer() ? "bg-blue-50 text-blue-600 hover:bg-blue-100" : "bg-gray-100 text-gray-400 cursor-not-allowed"
+              )}
+              disabled={!canCreateCustomer()}
             >
               <UserPlus size={16} />
             </button>
@@ -477,196 +597,258 @@ export default function SalesWorkbench() {
         </div>
 
         <div className="flex-1 overflow-y-auto scrollbar-thin">
-          {conversations.map((conv) => {
-            const c = conv.customer;
-            const name = c?.name ?? "未命名";
-            const time = timeLabel(conv.last_message_at ?? conv.created_at);
-            const school = schoolLabel(c);
-            const risk = false; // 你后面想做“待回复/超时风险”时再加逻辑
-
-            return (
-              <div
-                key={conv.id}
-                onClick={() => setSelectedConversationId(conv.id)}
-                className={`p-4 border-b border-gray-50 cursor-pointer transition-all ${
-                  selectedConversationId === conv.id ? "bg-blue-50/50 border-r-4 border-r-blue-600" : "hover:bg-gray-50"
-                }`}
-              >
-                <div className="flex justify-between items-start mb-1">
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-gray-900 text-sm">{name}</span>
-                  </div>
-                  <span className="text-[10px] text-gray-400">{time}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-xs text-gray-500 truncate w-32">{school}</span>
-                  {risk && <Timer size={14} className="text-red-500 animate-pulse" />}
-                </div>
-              </div>
-            );
-          })}
-
-          {conversations.length === 0 && (
+          {booting ? (
+            <div className="p-8 text-center text-sm text-gray-400">加载中…</div>
+          ) : conversations.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-gray-400">暂无会话</p>
+              <p className="text-xs text-gray-400 mt-1">请先在 Supabase 插入 conversations / messages</p>
             </div>
+          ) : (
+            conversations.map((c) => {
+              const isActive = selectedConversationId === c.id;
+              const cust = c.customers;
+              const isRisk = false; // 你可以后续接规则：例如超时未回复、情绪分等
+              return (
+                <div
+                  key={c.id}
+                  onClick={() => setSelectedConversationId(c.id)}
+                  className={cn(
+                    "p-4 border-b border-gray-50 cursor-pointer transition-all",
+                    isActive ? "bg-blue-50/50 border-r-4 border-r-blue-600" : "hover:bg-gray-50"
+                  )}
+                >
+                  <div className="flex justify-between items-start mb-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-bold text-gray-900 text-sm truncate">{cust?.name || "未命名客户"}</span>
+                      {c.owner_user_id === currentUserId && (
+                        <span className="text-[8px] bg-blue-100 text-blue-600 px-1 py-0.5 rounded tracking-tighter uppercase font-bold">
+                          我的
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10px] text-gray-400">{timeAgo(c.last_message_at)}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-gray-500 truncate w-40">{schoolLabel(cust)}</span>
+                    {isRisk && <Timer size={14} className="text-red-500 animate-pulse" />}
+                  </div>
+                </div>
+              );
+            })
           )}
         </div>
       </div>
 
       {/* Middle: Chat */}
       <div className="col-span-6 bg-white rounded-2xl border border-gray-100 flex flex-col overflow-hidden shadow-sm">
-        <div className="p-4 border-b border-gray-50 flex justify-between items-center bg-gray-50/30 shrink-0">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <MessageSquare size={18} className="text-blue-600" />
-              <h3 className="font-bold text-gray-900 truncate">
-                {selectedCustomer?.name ?? "未选择会话"}
-              </h3>
-            </div>
-            <div className="mt-1 text-xs text-gray-500 truncate">
-              {selectedCustomer ? `${schoolLabel(selectedCustomer)} · ${selectedCustomer.age ? `${selectedCustomer.age}岁` : ""}` : "请选择左侧会话"}
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button className="p-2 rounded-xl bg-white border border-gray-200 text-gray-500 hover:bg-gray-50" title="电话回访（占位）">
-              <PhoneCall size={16} />
-            </button>
-            <button className="p-2 rounded-xl bg-white border border-gray-200 text-gray-500 hover:bg-gray-50" title="导出（占位）">
-              <FileText size={16} />
-            </button>
-            <button className="p-2 rounded-xl bg-white border border-gray-200 text-gray-500 hover:bg-gray-50" title="更多">
-              <MoreVertical size={16} />
-            </button>
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          {messages.map((m) => {
-            const isMe = m.sender_type === "user";
-            const label = isMe ? (m.sender?.name || me?.name || "我") : (selectedCustomer?.name || "客户");
-            return (
-              <div key={m.id} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
-                <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-                  isMe ? "bg-blue-600 text-white" : "bg-gray-50 text-gray-900 border border-gray-100"
-                }`}>
-                  <div className={`text-[11px] mb-1 ${isMe ? "text-blue-100" : "text-gray-400"}`}>
-                    {label} · {timeLabel(m.created_at)}
-                  </div>
-                  <div className="whitespace-pre-wrap">{m.content}</div>
-                </div>
+        <div className="p-4 border-b border-gray-50 bg-gray-50/30 flex items-center justify-between">
+          <div className="flex items-center gap-2 min-w-0">
+            <MessageSquare size={18} className="text-blue-600" />
+            <div className="min-w-0">
+              <div className="font-bold text-gray-900 truncate">
+                {selectedCustomer?.name || "请选择一个会话"}
               </div>
-            );
-          })}
-          <div ref={listEndRef} />
+              <div className="text-xs text-gray-500 truncate">
+                {selectedCustomer ? schoolLabel(selectedCustomer) : "—"}
+              </div>
+            </div>
+          </div>
+
+          <div className="text-xs text-gray-500">
+            {currentProfile ? (
+              <span>
+                当前身份：<b className="text-gray-800">{currentProfile.name}</b>{" "}
+                <span className="ml-1 rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-600">
+                  {currentProfile.role}
+                </span>
+              </span>
+            ) : (
+              <span className="text-red-500">未登录 / 未找到 profile</span>
+            )}
+          </div>
         </div>
 
-        <div className="border-t border-gray-100 p-3 bg-white">
-          <div className="flex gap-2 items-end">
-            <textarea
-              value={messageInput}
-              onChange={(e) => setMessageInput(e.target.value)}
-              placeholder={canSendMessage ? "输入回复…" : "无权限发送（顾问只能编辑自己的会话）"}
-              className="flex-1 resize-none rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-blue-500"
-              rows={2}
-              disabled={!canSendMessage || sending || !selectedConversation}
-            />
-            <button
-              onClick={handleSend}
-              disabled={!canSendMessage || sending || !selectedConversation || !messageInput.trim()}
-              className={`h-11 px-4 rounded-2xl font-bold text-sm inline-flex items-center gap-2 ${
-                (!canSendMessage || sending || !selectedConversation || !messageInput.trim())
-                  ? "bg-gray-100 text-gray-400"
-                  : "bg-blue-600 text-white hover:bg-blue-700"
-              }`}
-              title="发送"
-            >
-              <Send size={16} />
-              发送
-            </button>
-          </div>
+        <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3 bg-white">
+          {loadingMessages ? (
+            <div className="text-sm text-gray-400 text-center py-8">加载消息中…</div>
+          ) : selectedConversationId && messages.length === 0 ? (
+            <div className="text-sm text-gray-400 text-center py-8">暂无消息</div>
+          ) : (
+            messages.map((m) => {
+              const isUser = m.sender_type === "user";
+              const name = isUser ? (m.sender?.name || "顾问") : (selectedCustomer?.name || "客户");
+              return (
+                <div key={m.id} className={cn("flex", isUser ? "justify-end" : "justify-start")}>
+                  <div
+                    className={cn(
+                      "max-w-[78%] rounded-2xl px-4 py-3 border text-sm leading-relaxed",
+                      isUser
+                        ? "bg-blue-600 text-white border-blue-600"
+                        : "bg-gray-50 text-gray-800 border-gray-100"
+                    )}
+                  >
+                    <div className={cn("text-[10px] mb-1", isUser ? "text-blue-100" : "text-gray-400")}>
+                      {name} · {new Date(m.created_at).toLocaleString()}
+                    </div>
+                    <div className="whitespace-pre-wrap">{m.content}</div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Composer */}
+        <div className="p-4 border-t border-gray-50 bg-gray-50/30">
+          {!selectedConversationId ? (
+            <div className="text-sm text-gray-400">请选择会话后开始回复</div>
+          ) : !canSendMessage() ? (
+            <div className="text-sm text-gray-400">
+              当前账号无权限发送消息（viewer 或非本人会话）。
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <input
+                value={composer}
+                onChange={(e) => setComposer(e.target.value)}
+                placeholder="输入回复内容…"
+                className="flex-1 bg-white border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    if (!sending) handleSend();
+                  }
+                }}
+              />
+              <button
+                onClick={handleSend}
+                disabled={sending || !composer.trim()}
+                className={cn(
+                  "px-4 py-2.5 rounded-xl font-bold inline-flex items-center gap-2",
+                  sending || !composer.trim()
+                    ? "bg-gray-200 text-gray-500 cursor-not-allowed"
+                    : "bg-blue-600 text-white hover:bg-blue-700"
+                )}
+              >
+                <Send size={16} />
+                发送
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Right: AI + Profile */}
-      <div className="col-span-3 bg-white rounded-2xl border border-gray-100 flex flex-col overflow-hidden shadow-sm">
-        <div className="p-4 border-b border-gray-50 bg-gray-50/30 shrink-0">
-          <h3 className="font-bold text-gray-900 flex items-center gap-2">
-            <Sparkles size={18} className="text-purple-600" />
-            AI & 客户画像
-          </h3>
-          <div className="mt-1 text-xs text-gray-500">
-            {selectedCustomer ? "根据当前会话生成建议" : "请选择会话查看"}
+      {/* Right: Panels */}
+      <div className="col-span-3 space-y-6 overflow-y-auto pr-1">
+        {/* Insight */}
+        <div className="rounded-2xl border border-gray-100 bg-white p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-bold text-gray-900 flex items-center gap-2">
+              <Sparkles size={16} className="text-purple-600" />
+              客户画像
+            </div>
+            <div className="text-[10px] text-gray-400">
+              {insight?.updated_at ? `更新：${timeAgo(insight.updated_at)}` : ""}
+            </div>
           </div>
-        </div>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {/* Insight */}
-          <div className="rounded-2xl border border-gray-100 bg-white p-4">
-            <div className="text-sm font-bold text-gray-900 mb-2">客户画像</div>
-            {!selectedCustomer ? (
-              <div className="text-sm text-gray-400">暂无数据</div>
-            ) : (
-              <>
-                <div className="text-xs text-gray-500 mb-2">情绪分 / 参与度</div>
-                <div className="flex items-center gap-2">
-                  <div className="text-2xl font-bold text-gray-900">{insight?.emotion_score ?? 50}</div>
-                  <div className="text-xs text-gray-500">
-                    {insight?.engagement_level ?? "medium"}
+          {selectedCustomer ? (
+            <>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div className="rounded-xl bg-gray-50 p-3 border border-gray-100">
+                  <div className="text-[10px] text-gray-400 font-bold">情绪分</div>
+                  <div className="text-lg font-black text-gray-900">
+                    {insight?.emotion_score ?? "—"}
                   </div>
                 </div>
+                <div className="rounded-xl bg-gray-50 p-3 border border-gray-100">
+                  <div className="text-[10px] text-gray-400 font-bold">互动</div>
+                  <div className="text-lg font-black text-gray-900">
+                    {insight?.engagement_level ?? "—"}
+                  </div>
+                </div>
+              </div>
 
-                <div className="mt-3">
-                  <div className="text-xs text-gray-500 mb-1">标签</div>
-                  <div className="flex flex-wrap gap-2">
-                    {(Array.isArray(insight?.tags) ? insight?.tags : []).slice(0, 6).map((t: any, i: number) => (
-                      <span key={i} className="text-[11px] px-2 py-1 rounded-full bg-blue-50 text-blue-700">
+              <div className="mb-3">
+                <div className="text-xs font-bold text-gray-600 mb-2">标签</div>
+                <div className="flex flex-wrap gap-2">
+                  {safeJsonArray(insight?.tags).length ? (
+                    safeJsonArray(insight?.tags).map((t, idx) => (
+                      <span
+                        key={`${t}-${idx}`}
+                        className="text-[10px] px-2 py-1 rounded-full bg-blue-50 text-blue-700 border border-blue-100"
+                      >
                         {String(t)}
                       </span>
-                    ))}
-                    {(!insight?.tags || (Array.isArray(insight.tags) && insight.tags.length === 0)) && (
-                      <span className="text-[11px] text-gray-400">暂无</span>
-                    )}
-                  </div>
+                    ))
+                  ) : (
+                    <span className="text-xs text-gray-400">暂无</span>
+                  )}
                 </div>
-              </>
-            )}
-          </div>
-
-          {/* Suggestions */}
-          <div className="rounded-2xl border border-gray-100 bg-white p-4">
-            <div className="flex items-center justify-between mb-2">
-              <div className="text-sm font-bold text-gray-900">AI 建议</div>
-              <button className="text-xs text-gray-500 hover:text-gray-900 inline-flex items-center gap-1" onClick={async () => {
-                if (selectedConversation?.id && selectedCustomer?.id) {
-                  await loadInsightAndSuggestions(selectedCustomer.id, selectedConversation.id);
-                }
-              }}>
-                <RefreshCw size={14} />
-                刷新
-              </button>
-            </div>
-
-            {suggestions.length === 0 ? (
-              <div className="text-sm text-gray-400">暂无建议</div>
-            ) : (
-              <div className="space-y-3">
-                {suggestions.slice(0, 5).map((s) => (
-                  <div key={s.id} className="rounded-2xl border border-gray-100 p-3 bg-gray-50/40">
-                    <div className="text-xs text-gray-500 mb-1">
-                      {s.stage} · {s.suggestion_type}
-                    </div>
-                    <div className="text-sm font-bold text-gray-900">{s.title}</div>
-                    <div className="mt-1 text-sm text-gray-700 whitespace-pre-wrap">{s.content}</div>
-                  </div>
-                ))}
               </div>
-            )}
+
+              <div>
+                <div className="text-xs font-bold text-gray-600 mb-2">历史节点</div>
+                <div className="space-y-2">
+                  {safeJsonArray(insight?.historical_notes).length ? (
+                    safeJsonArray(insight?.historical_notes).slice(0, 5).map((h: any, idx) => (
+                      <div
+                        key={idx}
+                        className="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 text-xs text-gray-700"
+                      >
+                        <div className="text-[10px] text-gray-400 font-bold">{h?.date || "—"}</div>
+                        <div>{h?.event || JSON.stringify(h)}</div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-gray-400">暂无</div>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="text-sm text-gray-400">请选择会话查看客户画像</div>
+          )}
+        </div>
+
+        {/* AI Suggestion */}
+        <div className="rounded-2xl border border-gray-100 bg-white p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-bold text-gray-900 flex items-center gap-2">
+              <Sparkles size={16} className="text-emerald-600" />
+              AI 建议
+            </div>
+            <div className="text-[10px] text-gray-400">
+              {suggestion?.updated_at ? `更新：${timeAgo(suggestion.updated_at)}` : ""}
+            </div>
           </div>
+
+          {selectedConversationId ? (
+            suggestion ? (
+              <div className="space-y-2">
+                <div className="text-xs text-gray-500">
+                  <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-600 mr-2">
+                    {suggestion.stage}
+                  </span>
+                  <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-600">
+                    {suggestion.suggestion_type}
+                  </span>
+                </div>
+                <div className="text-sm font-black text-gray-900">{suggestion.title}</div>
+                <div className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
+                  {suggestion.content}
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-gray-400">暂无 AI 建议（ai_suggestions 表为空或无权限）</div>
+            )
+          ) : (
+            <div className="text-sm text-gray-400">请选择会话查看 AI 建议</div>
+          )}
 
           {/* Quick links (占位) */}
-          <div className="rounded-2xl border border-gray-100 bg-white p-4">
+          <div className="rounded-2xl border border-gray-100 bg-white p-4 mt-4">
             <div className="text-sm font-bold text-gray-900 mb-2">快捷操作</div>
             <div className="grid grid-cols-2 gap-2">
               <button className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 hover:bg-gray-50 inline-flex items-center gap-2">
