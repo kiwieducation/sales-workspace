@@ -79,6 +79,27 @@ export default function WorkspaceLayout({ children }: { children: ReactNode }) {
 
   const displayName = profile?.name || userEmail || "未登录";
   const displayRole = profile?.role || null;
+  const canSeeNav = (href: string) => {
+    // admin：全部可见
+    if (displayRole === "admin") return true;
+
+    // consultant：销售 / 知识库 / 合同
+    if (displayRole === "consultant") {
+      return (
+        href === "/workspace/sales" ||
+        href === "/workspace/kb" ||
+        href === "/workspace/contracts"
+      );
+    }
+
+    // viewer：只读知识库
+    if (displayRole === "viewer") {
+      return href === "/workspace/kb";
+    }
+
+    // 未登录：不显示
+    return false;
+  };
 
   return (
     <div className="flex h-screen bg-slate-50">
