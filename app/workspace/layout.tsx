@@ -1,6 +1,6 @@
-import SidebarNav from "@/components/SidebarNav";
 "use client";
 
+import SidebarNav from "@/components/SidebarNav";
 import { ReactNode, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
