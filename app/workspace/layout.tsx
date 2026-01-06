@@ -1,3 +1,4 @@
+import SidebarNav from "@/components/SidebarNav";
 "use client";
 
 import { ReactNode, useEffect, useMemo, useState } from "react";
@@ -92,7 +93,7 @@ export default function WorkspaceLayout({ children }: { children: ReactNode }) {
           </div>
 
           <nav className="space-y-1 text-sm">
-            {navItems.map((item) => (
+            {navItems.filter((item) => canSeeNav(item.href)).map((item) => (
               <SidebarItem
                 key={item.href}
                 href={item.href}
