@@ -15,3 +15,12 @@ yarn-error.log*
 .env.local
 node_modules/
 .DS_Store
+
+# local backups
+*.bak
+*.save
+
+# wecom keys (NEVER commit)
+wecom_private.pem
+wecom_private_rsa.pem
+wecom_public.pem
