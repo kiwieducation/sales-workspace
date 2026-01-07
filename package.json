@@ -6,7 +6,8 @@
     "dev": "NODE_OPTIONS=--use-openssl-ca next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "postinstall": "node scripts/fix-wework-chat-node.cjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
