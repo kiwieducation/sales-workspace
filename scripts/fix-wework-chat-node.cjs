@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
- * Ensure wework-chat-node native binding exists for Vercel runtime patch drift.
+ * Postinstall hardening for wework-chat-node on Vercel Serverless.
  *
- * What this script does (postinstall on Vercel):
- * 1) Copy build/Release/wework.node -> compiled/<ver>/linux/x64/wework.node (patch window)
- * 2) Patch absolute build-time path strings in lib/*.so:
- *    "/vercel/path0" -> "/var/task" (equal-length replacement with NUL padding)
+ * Goals:
+ * 1) Copy build/Release/wework.node -> compiled/<patch>/linux/x64/wework.node (patch window)
+ * 2) Purge build-time absolute prefix "/vercel/path0" from ALL native binaries:
+ *    - lib/*.so
+ *    - build/Release/*.node
+ *    - compiled/**/wework.node
  *
- * Always exit(0) within 10s (never block deployment).
+ * Always exit(0) within 12s.
  */
 const fs = require("fs");
 const path = require("path");
@@ -37,21 +39,18 @@ function copy(src, dst) {
     return false;
   }
 }
-
 function parse(v) {
   const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(v || ""));
   return m ? { maj: +m[1], min: +m[2], pat: +m[3] } : null;
 }
-
 function moduleRoot(name) {
-  // This runs in Node during install/build, safe to use require.resolve here.
   const p = require.resolve(`${name}/package.json`, { paths: [process.cwd()] });
   return path.dirname(p);
 }
 
 /**
- * Binary-safe equal-length string replacement with NUL padding.
- * This avoids breaking ELF layout.
+ * Binary-safe equal-length replacement (NUL padded).
+ * Keeps ELF layout stable.
  */
 function replaceInBinary(filePath, fromStr, toStr) {
   try {
@@ -59,7 +58,6 @@ function replaceInBinary(filePath, fromStr, toStr) {
     const from = Buffer.from(fromStr, "utf8");
     const toRaw = Buffer.from(toStr, "utf8");
 
-    // Must be equal or shorter; pad with \0 to keep same length
     if (toRaw.length > from.length) {
       log("skip replace (toStr longer than fromStr)", filePath);
       return false;
@@ -67,8 +65,6 @@ function replaceInBinary(filePath, fromStr, toStr) {
     const to = Buffer.concat([toRaw, Buffer.alloc(from.length - toRaw.length, 0)]);
 
     let replaced = false;
-
-    // naive scan; lib sizes are small, OK
     for (let i = 0; i <= buf.length - from.length; i++) {
       let match = true;
       for (let j = 0; j < from.length; j++) {
@@ -86,90 +82,107 @@ function replaceInBinary(filePath, fromStr, toStr) {
 
     if (replaced) {
       fs.writeFileSync(filePath, buf);
-      log("patched absolute path string in", filePath, `${fromStr} -> ${toStr}`);
+      log("patched:", filePath, `${fromStr} -> ${toStr}`);
     }
     return replaced;
   } catch (e) {
-    log("replaceInBinary failed", filePath, e?.message || String(e));
+    log("replaceInBinary failed:", filePath, e?.message || String(e));
     return false;
   }
+}
+
+function walkFiles(dir, pred, out = []) {
+  try {
+    const ents = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of ents) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walkFiles(p, pred, out);
+      else if (e.isFile() && pred(p)) out.push(p);
+    }
+  } catch {}
+  return out;
 }
 
 const timer = setTimeout(() => {
   log("timeout -> exit(0)");
   process.exit(0);
-}, 10_000);
+}, 12_000);
 
 try {
   log("postinstall start");
   const root = moduleRoot("wework-chat-node");
 
-  // 1) Patch wework.node across a small Node patch window
-  const src = [
-    path.join(root, "build", "Release", "wework.node"),
-    path.join(root, "build", "Debug", "wework.node"),
-  ].find(exists);
+  // ---- 1) copy wework.node across patch window ----
+  const srcNode =
+    [path.join(root, "build", "Release", "wework.node"), path.join(root, "build", "Debug", "wework.node")].find(exists);
 
-  if (!src) {
-    log("no wework.node, skip");
+  if (!srcNode) {
+    log("no wework.node in build/, skip copy");
   } else {
     const nodeV = process.versions.node;
     const p = parse(nodeV);
     const vers = new Set();
 
     if (p) {
-      // patch window: current-2 ... current+6
-      for (let pat = Math.max(0, p.pat - 2); pat <= p.pat + 6; pat++) {
+      for (let pat = Math.max(0, p.pat - 2); pat <= p.pat + 12; pat++) {
         vers.add(`${p.maj}.${p.min}.${pat}`);
       }
     } else {
       vers.add(String(nodeV));
     }
-
-    // known runtime patch observed in your logs
+    // ensure current runtime patch
     vers.add("20.19.5");
 
     let copied = 0;
     const sample = [];
     for (const v of vers) {
       const dst = path.join(root, "compiled", v, "linux", "x64", "wework.node");
-      if (copy(src, dst)) {
+      if (copy(srcNode, dst)) {
         copied++;
         if (sample.length < 10) sample.push(dst);
       }
     }
 
-    log("fixed:");
-    log("  from:", src);
+    log("copied wework.node:");
+    log("  from:", srcNode);
     log("  sample to:", sample);
     log("  total copies:", copied);
   }
 
-  // 2) Patch lib/*.so absolute build-time paths that leak into runtime
-  //    Symptom: runtime error referencing "/vercel/path0/node_modules/.../libWeWorkFinanceSdk_C.so"
-  try {
-    const libDir = path.join(root, "lib");
-    if (!exists(libDir)) {
-      log("no lib dir, skip abs-path patch");
-    } else {
-      const files = fs.readdirSync(libDir).filter((f) => f.endsWith(".so"));
-      if (!files.length) {
-        log("no .so files, skip abs-path patch");
-      } else {
-        const fromStr = "/vercel/path0";
-        const toStr = "/var/task";
+  // ---- 2) patch absolute build prefix across ALL native binaries ----
+  const fromStr = "/vercel/path0";
+  const toStr = "/var/task";
 
-        let patched = 0;
-        for (const f of files) {
-          const p = path.join(libDir, f);
-          if (replaceInBinary(p, fromStr, toStr)) patched++;
-        }
-        log("absolute path patch done. patched files:", patched);
-      }
+  let patchedCount = 0;
+
+  // 2a) lib/*.so
+  const libDir = path.join(root, "lib");
+  if (exists(libDir)) {
+    const soFiles = fs.readdirSync(libDir).filter((f) => f.endsWith(".so")).map((f) => path.join(libDir, f));
+    for (const f of soFiles) {
+      if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
     }
-  } catch (e) {
-    log("abs-path patch ERROR (ignored):", e?.message || String(e));
   }
+
+  // 2b) build/**/*.node (just in case)
+  const buildDir = path.join(root, "build");
+  if (exists(buildDir)) {
+    const nodeFiles = walkFiles(buildDir, (p) => p.endsWith(".node"));
+    for (const f of nodeFiles) {
+      if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
+    }
+  }
+
+  // 2c) compiled/**/wework.node
+  const compiledDir = path.join(root, "compiled");
+  if (exists(compiledDir)) {
+    const compiledNodes = walkFiles(compiledDir, (p) => p.endsWith(".node"));
+    for (const f of compiledNodes) {
+      if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
+    }
+  }
+
+  log("absolute prefix patch done. patched files:", patchedCount);
 } catch (e) {
   log("ERROR (ignored):", e && e.stack ? e.stack : e);
 } finally {
