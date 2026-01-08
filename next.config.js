@@ -1,11 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   /**
-   * 终局策略：
-   * - 强制把 wework-chat-node 的所有 native 产物（.node/.so/compiled/**）带进 serverless 函数包
-   * - 同时带上 vendor/wecom/lib（用于补齐 OpenSSL 等依赖）
-   *
-   * 用 "/*" 是为了稳定：避免 App Router/Route Handler 的 key 命中差异导致 include 失效。
+   * 关键：让 wework-chat-node 不被打包进 .next 产物
+   * 否则 bindings 会在 /var/task/.next/... 里找 wework.node（你现在就是这个情况）
+   */
+  serverExternalPackages: ["wework-chat-node"],
+
+  /**
+   * 同时强制把 wework-chat-node 的所有文件带进函数包（.node/.so/compiled/**）
+   * 以及 vendor/wecom/lib（后续如果要补依赖库）
    */
   outputFileTracingIncludes: {
     "/*": [
