@@ -1,27 +1,19 @@
 // lib/wecom/msgaudit.ts
-import crypto from "crypto";
-import { createRequire } from "module";
 
-const require = createRequire(import.meta.url);
+type WeWorkChatNodeModule = any;
 
-// wework-chat-node 是 native addon + CommonJS
-type WeWorkChatCtor = new (opts: {
-  corpId: string;
-  secret: string;
-  privateKey: string;
-}) => {
-  getChatData: (args: {
-    seq: number;
-    limit: number;
-    timeout: number;
-  }) => Promise<{
-    errcode?: number;
-    errmsg?: string;
-    chatdata?: any[];
-  }>;
-};
+let _wework: WeWorkChatNodeModule | null = null;
 
-let WeWorkChatCached: WeWorkChatCtor | null = null;
+function getWework(): WeWorkChatNodeModule {
+  if (_wework) return _wework;
+
+  // ✅ 关键：用 eval("require") 避免 Next/Turbopack 静态分析并内联到 .next
+  const req = (eval("require") as any) as (id: string) => any;
+  const mod = req("wework-chat-node");
+
+  _wework = mod?.default ?? mod;
+  return _wework;
+}
 
 function env(name: string) {
   return (process.env[name] ?? "").trim();
@@ -33,101 +25,37 @@ function mustEnv(name: string) {
   return v;
 }
 
-function getWeWorkChatCtor(): WeWorkChatCtor {
-  if (WeWorkChatCached) return WeWorkChatCached;
-
-  // 兼容 CommonJS / default export
-  const pkg = require("wework-chat-node");
-  const mod = (pkg && pkg.default) ? pkg.default : pkg;
-  if (!mod?.WeWorkChat) {
-    throw new Error("wework-chat-node: cannot find WeWorkChat export");
-  }
-  WeWorkChatCached = mod.WeWorkChat as WeWorkChatCtor;
-  return WeWorkChatCached;
-}
-
-function getWeWorkClient() {
-  const corpId = mustEnv("WECOM_CORP_ID");
-
-  // ✅ 统一用 WECOM_CORP_SECRET（你现在 Vercel 上也是这个）
-  // 兼容老变量（如果你本地还留着 WECOM_MSG_ARCHIVE_SECRET）
-  const secret = env("WECOM_CORP_SECRET") || env("WECOM_MSG_ARCHIVE_SECRET");
-  if (!secret) {
-    throw new Error("missing env: WECOM_CORP_SECRET");
-  }
-
-  // ✅ 统一用 WECOM_MSG_ARCHIVE_PRIVATE_KEY
-  // 兼容老变量（如果你本地还留着 WECOM_RSA_PRIVATE_KEY / WECOM_RSA_PRIVATE_KEY）
-  const privateKeyRaw =
-    env("WECOM_MSG_ARCHIVE_PRIVATE_KEY") ||
-    env("WECOM_RSA_PRIVATE_KEY") ||
-    env("WECOM_RSA_PRIVATE_KEY_PEM");
-  if (!privateKeyRaw) {
-    throw new Error("missing env: WECOM_MSG_ARCHIVE_PRIVATE_KEY");
-  }
-
-  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
-  const WeWorkChat = getWeWorkChatCtor();
-  return new WeWorkChat({ corpId, secret, privateKey });
-}
-
-export async function wecomPullChatData(args: {
+/**
+ * 拉取会话存档（wework-chat-node 原生 SDK）
+ */
+export async function wecomPullChatData(params: {
   seq: number;
   limit: number;
   timeout: number;
-}): Promise<{ pulled: number; nextSeq: number; items: any[] }> {
-  const client = getWeWorkClient();
-  const res = await client.getChatData({
-    seq: args.seq,
-    limit: args.limit,
-    timeout: args.timeout,
+}) {
+  const wework = getWework();
+
+  const corpId = mustEnv("WECOM_CORP_ID");
+  const secret = mustEnv("WECOM_MSG_ARCHIVE_SECRET");
+
+  // wework-chat-node 的构造形态：new wework.getChatData({ corpId, secret })
+  const sdk = new wework.getChatData({ corpId, secret });
+
+  return await new Promise<any>((resolve, reject) => {
+    sdk.getChatData(params.seq, params.limit, params.timeout, (err: any, data: any) => {
+      if (err) return reject(err);
+      resolve(data);
+    });
   });
-
-  if (res.errcode && res.errcode !== 0) {
-    throw new Error(`getchatdata failed: ${res.errcode} ${res.errmsg || ""}`.trim());
-  }
-
-  const items = res.chatdata ?? [];
-  const nextSeq = items.length ? items[items.length - 1].seq : args.seq;
-
-  return { pulled: items.length, nextSeq, items };
 }
 
 /**
- * 解密单条 chatdata（企业微信会话存档返回的加密结构）
- * item 里一般会有 encrypt_random_key / encrypt_chat_msg
+ * 解密单条消息（wework-chat-node 原生 SDK）
  */
-export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
-  const encRandomKeyB64 = item.encrypt_random_key;
-  const encChatMsgB64 = item.encrypt_chat_msg;
+export function decryptChatDataItem(item: any, privateKeyPem: string) {
+  const wework = getWework();
+  const sdk = new wework.decryptData({ privateKey: privateKeyPem });
 
-  if (!encRandomKeyB64 || !encChatMsgB64) {
-    throw new Error("invalid chatdata item: missing encrypt_random_key/encrypt_chat_msg");
-  }
-
-  // 1) RSA 解出随机 key（16 bytes）
-  const randomKey = crypto.privateDecrypt(
-    {
-      key: rsaPrivateKeyPem,
-      padding: crypto.constants.RSA_PKCS1_PADDING,
-    },
-    Buffer.from(encRandomKeyB64, "base64")
-  );
-
-  // 2) AES-256-CBC 解密 chat msg（企业微信返回：key + iv + ciphertext）
-  // 实际格式：randomKey(16) 用于派生 aesKey/iv
-  // 这里按常见实现：aesKey = sha256(randomKey), iv = md5(randomKey)
-  const aesKey = crypto.createHash("sha256").update(randomKey).digest(); // 32 bytes
-  const iv = crypto.createHash("md5").update(randomKey).digest(); // 16 bytes
-
-  const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
-  decipher.setAutoPadding(true);
-
-  const plain = Buffer.concat([
-    decipher.update(Buffer.from(encChatMsgB64, "base64")),
-    decipher.final(),
-  ]).toString("utf8");
-
-  // 3) JSON parse
-  return JSON.parse(plain);
+  // item.encrypt_random_key / item.encrypt_chat_msg 来自 getchatdata 返回
+  return sdk.decryptData(item.encrypt_random_key, item.encrypt_chat_msg);
 }
