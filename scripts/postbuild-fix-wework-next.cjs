@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 /**
- * postbuild-fix-wework-next.cjs
+ * postbuild-fix-wework-next.cjs (FINAL)
  *
- * Stable fix for Vercel + Next bundling:
- * - When wework-chat-node is bundled into .next, bindings lookup root becomes /var/task/.next/...
- * - The error shows it tries:
- *     /var/task/.next/compiled/<nodeVer>/linux/x64/wework.node
- * - So after `next build`, copy the built addon into `.next/compiled/<ver>/linux/x64/wework.node`
- *   for a small patch window (+ known runtime patch 20.19.5).
+ * Goal: Make `bindings` always find wework.node on Vercel runtime.
+ * Observed runtime error tried paths (under /var/task/.next/...):
+ *   - .next/compiled/<ver>/linux/x64/wework.node
+ *   - .next/build/{Release,Debug}/wework.node
+ *   - .next/build/wework.node
+ *   - .next/build/default/wework.node
+ *   - .next/{Release,Debug}/wework.node
+ *   - .next/out/{Release,Debug}/wework.node
  *
- * Never fails the build.
+ * Strategy:
+ *   - After `next build`, copy the built addon `node_modules/wework-chat-node/build/Release/wework.node`
+ *     into ALL of the above candidate locations inside `.next/`.
+ *   - Also cover small patch window and known runtime patch (20.19.5) for .next/compiled/<ver>/...
+ *   - Always succeed (never fail build).
  */
 
 const fs = require("fs");
@@ -54,7 +60,7 @@ function main() {
   const cwd = process.cwd();
   const nextDir = path.join(cwd, ".next");
   if (!exists(nextDir)) {
-    log("skip: .next not found (this must run after `next build`)");
+    log("skip: .next not found (must run after `next build`)");
     return;
   }
 
@@ -71,10 +77,33 @@ function main() {
     return;
   }
 
+  // -------- 1) Copy into generic .next locations (bindings tried these)
+  const genericTargets = [
+    path.join(nextDir, "build", "wework.node"),
+    path.join(nextDir, "build", "default", "wework.node"),
+    path.join(nextDir, "build", "Release", "wework.node"),
+    path.join(nextDir, "build", "Debug", "wework.node"),
+    path.join(nextDir, "Release", "wework.node"),
+    path.join(nextDir, "Debug", "wework.node"),
+    path.join(nextDir, "out", "Release", "wework.node"),
+    path.join(nextDir, "out", "Debug", "wework.node"),
+  ];
+
+  let copied = 0;
+  const sample = [];
+
+  for (const dst of genericTargets) {
+    if (safeCopy(src, dst)) {
+      copied++;
+      if (sample.length < 12) sample.push(dst);
+    }
+  }
+
+  // -------- 2) Copy into .next/compiled/<ver>/linux/x64/wework.node (bindings also tried)
   const platform = "linux";
   const arch = "x64";
 
-  const buildNode = process.versions.node; // e.g. 20.19.6 at build
+  const buildNode = process.versions.node; // build env version
   const parsed = parseNodeVersion(buildNode);
 
   const versions = new Set();
@@ -88,16 +117,12 @@ function main() {
     versions.add(String(buildNode));
   }
 
-  // Known Vercel runtime patch
+  // Known runtime patch observed on Vercel
   versions.add("20.19.5");
 
-  // Optional hints
   for (const v of [process.env.VERCEL_NODE_VERSION, process.env.NODE_VERSION].filter(Boolean)) {
     versions.add(String(v));
   }
-
-  let copied = 0;
-  const sample = [];
 
   for (const ver of versions) {
     const dst = path.join(nextDir, "compiled", ver, platform, arch, "wework.node");
