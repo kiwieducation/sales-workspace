@@ -1,15 +1,12 @@
-/**
- * scripts/fix-wework-chat-node.cjs
+#!/usr/bin/env node
+/* scripts/fix-wework-chat-node.cjs
  *
- * Fix for Vercel runtime/build Node patch mismatch when using wework-chat-node.
- * It copies the built native binding `wework.node` into:
- *   node_modules/wework-chat-node/compiled/<nodeVer>/<platform>/<arch>/wework.node
+ * Fast + safe workaround for Vercel Build/Runtime Node patch drift
+ * with native addon loader path: compiled/<nodeVer>/linux/x64/wework.node
  *
- * And (important) it also copies into a patch-range for the same major.minor
- * (e.g. 20.19.0 ~ 20.19.30) so that if Vercel runs a different patch than build,
- * the bindings loader can still find it.
- *
- * This script must NEVER fail the install; it always exits 0.
+ * - Small patch window only (avoid IO explosion / 45min build risk)
+ * - Hard timeout, always exit(0)
+ * - Force linux/x64 targets on Vercel to match /var/task runtime
  */
 
 const fs = require("fs");
@@ -21,129 +18,139 @@ function log(...args) {
 
 function exists(p) {
   try {
-    fs.accessSync(p, fs.constants.F_OK);
+    fs.accessSync(p, fs.constants.R_OK);
     return true;
   } catch {
     return false;
   }
 }
 
-function mkdirp(p) {
+function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
 
-function safeCopy(from, to) {
-  mkdirp(path.dirname(to));
-  fs.copyFileSync(from, to);
+function safeCopy(src, dst) {
   try {
-    fs.chmodSync(to, 0o755);
+    ensureDir(path.dirname(dst));
+    fs.copyFileSync(src, dst);
+    return true;
   } catch {
-    // ignore chmod failures
+    return false;
   }
 }
 
-function parseSemver(v) {
-  // v like "20.19.6"
-  const m = String(v).trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+function parseNodeVersion(v) {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(v || ""));
   if (!m) return null;
-  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+  return { major: +m[1], minor: +m[2], patch: +m[3] };
 }
 
-(async function main() {
-  // Guard: never hang forever (Vercel build timeouts are painful)
-  const timer = setTimeout(() => {
-    log("timeout; exiting 0");
-    process.exit(0);
-  }, 20_000);
+function getModuleRoot(moduleName) {
+  const pkgJsonPath = require.resolve(`${moduleName}/package.json`, {
+    paths: [process.cwd()],
+  });
+  return path.dirname(pkgJsonPath);
+}
 
-  try {
-    log("postinstall start");
+// ---- hard guard: never hang the build
+const timer = setTimeout(() => {
+  log("postinstall timeout -> exit(0)");
+  process.exit(0);
+}, 10_000);
 
-    // Resolve module root reliably
-    let modRoot;
-    try {
-      // package.json path inside the module
-      const pkgPath = require.resolve("wework-chat-node/package.json", {
-        paths: [process.cwd()],
-      });
-      modRoot = path.dirname(pkgPath);
-    } catch (e) {
-      log("cannot resolve module root; skip.", e?.message || e);
-      clearTimeout(timer);
-      process.exit(0);
-      return;
-    }
+function main() {
+  log("postinstall start");
 
-    const candidates = [
-      path.join(modRoot, "build", "Release", "wework.node"),
-      path.join(modRoot, "build", "wework.node"),
-      path.join(modRoot, "Release", "wework.node"),
-      path.join(modRoot, "wework.node"),
-    ];
+  const moduleRoot = getModuleRoot("wework-chat-node");
 
-    const from = candidates.find(exists);
-    if (!from) {
-      log("native binding not found in candidates; skip.");
-      log("checked:", candidates);
-      clearTimeout(timer);
-      process.exit(0);
-      return;
-    }
+  // Find source binding
+  const srcCandidates = [
+    path.join(moduleRoot, "build", "Release", "wework.node"),
+    path.join(moduleRoot, "build", "Debug", "wework.node"),
+  ];
+  const src = srcCandidates.find(exists);
 
-    const nodeVer = process.versions.node; // build-time node version
-    const platform = process.platform;     // linux / darwin
-    const arch = process.arch;             // x64 / arm64
-
-    const sem = parseSemver(nodeVer);
-    const targets = new Set();
-
-    // Always copy to exact build-time version
-    targets.add(nodeVer);
-
-    // Also copy a patch-range for the same major.minor (handles runtime patch mismatch)
-    if (sem) {
-      const maxPatch = Math.max(30, sem.patch); // 0..30 usually enough; keep small but safe
-      for (let p = 0; p <= maxPatch; p++) {
-        targets.add(`${sem.major}.${sem.minor}.${p}`);
-      }
-    }
-
-    // If user pins via engines "20.x", Vercel runtime sometimes differs by patch.
-    // Also add common known Node 20 patch that Vercel has used recently.
-    if (sem && sem.major === 20 && sem.minor === 19) {
-      targets.add("20.19.5");
-      targets.add("20.19.6");
-    }
-
-    let copied = 0;
-    const toList = [];
-
-    for (const ver of targets) {
-      const to = path.join(modRoot, "compiled", ver, platform, arch, "wework.node");
-      try {
-        safeCopy(from, to);
-        copied++;
-        // Only print a few to avoid noisy logs
-        if (toList.length < 6) toList.push(to);
-      } catch (e) {
-        // keep going
-      }
-    }
-
-    if (copied > 0) {
-      log("fixed:");
-      log("  from:", from);
-      log("  sample to:", toList);
-      log("  total copies:", copied);
-    } else {
-      log("no copies made; skip.");
-    }
-
-    clearTimeout(timer);
-    process.exit(0);
-  } catch (e) {
-    console.error("[wework-chat-node] error:", e?.message || e);
-    clearTimeout(timer);
-    process.exit(0); // never fail install
+  if (!src) {
+    log("no native binding found, skip");
+    log("tried:", srcCandidates);
+    return;
   }
-})();
+
+  const nodeV = process.versions.node; // build env node version
+  const parsed = parseNodeVersion(nodeV);
+
+  // On Vercel, runtime is linux/x64 in /var/task.
+  // Force targets to linux/x64 so paths match what the loader will look for.
+  const onVercel = !!process.env.VERCEL;
+  const platform = onVercel ? "linux" : process.platform;
+  const arch = onVercel ? "x64" : process.arch;
+
+  const targetVersions = new Set();
+
+  // Always include current build node (exact)
+  if (parsed) {
+    targetVersions.add(`${parsed.major}.${parsed.minor}.${parsed.patch}`);
+
+    // Patch window: (patch-2..patch+6) capped at >=0
+    for (let p = Math.max(0, parsed.patch - 2); p <= parsed.patch + 6; p++) {
+      targetVersions.add(`${parsed.major}.${parsed.minor}.${p}`);
+    }
+
+    // Known runtime drift anchor(s) you observed
+    // Keep small, but include ±1 around it to survive tiny pool changes.
+    const known = { major: 20, minor: 19, patch: 5 };
+    if (parsed.major === known.major && parsed.minor === known.minor) {
+      for (let p = Math.max(0, known.patch - 1); p <= known.patch + 1; p++) {
+        targetVersions.add(`${known.major}.${known.minor}.${p}`);
+      }
+    } else {
+      // still add the exact known runtime patch anyway
+      targetVersions.add("20.19.5");
+      targetVersions.add("20.19.6");
+    }
+  } else if (nodeV) {
+    targetVersions.add(String(nodeV));
+    // Still add known runtime patch
+    targetVersions.add("20.19.5");
+    targetVersions.add("20.19.6");
+  }
+
+  // Optional hints (usually empty, but harmless)
+  for (const v of [process.env.VERCEL_NODE_VERSION, process.env.NODE_VERSION].filter(Boolean)) {
+    targetVersions.add(String(v));
+  }
+
+  let copied = 0;
+  const targets = [];
+
+  for (const ver of targetVersions) {
+    const dst = path.join(moduleRoot, "compiled", ver, platform, arch, "wework.node");
+    if (safeCopy(src, dst)) {
+      copied++;
+      targets.push(dst);
+    }
+  }
+
+  // Ensure build/Release exists (some packages expect it)
+  const releaseTarget = path.join(moduleRoot, "build", "Release", "wework.node");
+  if (!exists(releaseTarget)) {
+    if (safeCopy(src, releaseTarget)) {
+      copied++;
+      targets.push(releaseTarget);
+    }
+  }
+
+  log("fixed:");
+  log("  from:", src);
+  log("  sample to:", targets.slice(0, 12));
+  log("  total copies:", copied);
+}
+
+try {
+  main();
+} catch (e) {
+  log("ERROR:", e && e.stack ? e.stack : e);
+} finally {
+  clearTimeout(timer);
+  process.exit(0);
+}
