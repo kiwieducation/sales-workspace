@@ -1,16 +1,14 @@
 #!/usr/bin/env node
-/**
- * Postinstall hardening for wework-chat-node on Vercel Serverless.
- *
- * Goals:
- * 1) Copy build/Release/wework.node -> compiled/<patch>/linux/x64/wework.node (patch window)
- * 2) Purge build-time absolute prefix "/vercel/path0" from ALL native binaries:
- *    - lib/*.so
- *    - build/Release/*.node
- *    - compiled/**/wework.node
- *
- * Always exit(0) within 12s.
- */
+
+// Postinstall hardening for wework-chat-node on Vercel Serverless.
+// Goals:
+// 1) Copy build/Release/wework.node -> compiled/<patch>/linux/x64/wework.node (patch window)
+// 2) Purge build-time absolute prefix "/vercel/path0" from ALL native binaries:
+//    - lib/*.so
+//    - build/**/*.node
+//    - compiled/**/*.node
+// Always exit(0) within 12s (never block deployment).
+
 const fs = require("fs");
 const path = require("path");
 
@@ -48,10 +46,7 @@ function moduleRoot(name) {
   return path.dirname(p);
 }
 
-/**
- * Binary-safe equal-length replacement (NUL padded).
- * Keeps ELF layout stable.
- */
+// Binary-safe equal-length replacement (NUL padded) to avoid breaking ELF layout.
 function replaceInBinary(filePath, fromStr, toStr) {
   try {
     const buf = fs.readFileSync(filePath);
@@ -112,9 +107,11 @@ try {
   log("postinstall start");
   const root = moduleRoot("wework-chat-node");
 
-  // ---- 1) copy wework.node across patch window ----
-  const srcNode =
-    [path.join(root, "build", "Release", "wework.node"), path.join(root, "build", "Debug", "wework.node")].find(exists);
+  // 1) Copy wework.node across patch window
+  const srcNode = [
+    path.join(root, "build", "Release", "wework.node"),
+    path.join(root, "build", "Debug", "wework.node"),
+  ].find(exists);
 
   if (!srcNode) {
     log("no wework.node in build/, skip copy");
@@ -124,14 +121,17 @@ try {
     const vers = new Set();
 
     if (p) {
+      // patch window: current-2 ... current+12
       for (let pat = Math.max(0, p.pat - 2); pat <= p.pat + 12; pat++) {
         vers.add(`${p.maj}.${p.min}.${pat}`);
       }
     } else {
       vers.add(String(nodeV));
     }
-    // ensure current runtime patch
+
+    // ensure current runtime patch as seen in your runtime
     vers.add("20.19.5");
+    vers.add("20.19.6");
 
     let copied = 0;
     const sample = [];
@@ -142,29 +142,30 @@ try {
         if (sample.length < 10) sample.push(dst);
       }
     }
-
     log("copied wework.node:");
     log("  from:", srcNode);
     log("  sample to:", sample);
     log("  total copies:", copied);
   }
 
-  // ---- 2) patch absolute build prefix across ALL native binaries ----
+  // 2) Patch "/vercel/path0" -> "/var/task" in ALL native binaries
   const fromStr = "/vercel/path0";
   const toStr = "/var/task";
-
   let patchedCount = 0;
 
   // 2a) lib/*.so
   const libDir = path.join(root, "lib");
   if (exists(libDir)) {
-    const soFiles = fs.readdirSync(libDir).filter((f) => f.endsWith(".so")).map((f) => path.join(libDir, f));
+    const soFiles = fs
+      .readdirSync(libDir)
+      .filter((f) => f.endsWith(".so"))
+      .map((f) => path.join(libDir, f));
     for (const f of soFiles) {
       if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
     }
   }
 
-  // 2b) build/**/*.node (just in case)
+  // 2b) build/**/*.node
   const buildDir = path.join(root, "build");
   if (exists(buildDir)) {
     const nodeFiles = walkFiles(buildDir, (p) => p.endsWith(".node"));
@@ -173,7 +174,7 @@ try {
     }
   }
 
-  // 2c) compiled/**/wework.node
+  // 2c) compiled/**/*.node
   const compiledDir = path.join(root, "compiled");
   if (exists(compiledDir)) {
     const compiledNodes = walkFiles(compiledDir, (p) => p.endsWith(".node"));
