@@ -3,49 +3,48 @@ import crypto from "crypto";
 import path from "path";
 
 /**
- * ✅ 终局加载器：完全 runtime 决策，避免 Turbopack 静态解析
- * - 不使用 require.resolve
- * - 不写 "wework-chat-node/lib" 这类子路径常量
- * - 通过读取 package.json 的 main 字段 + moduleRoot 计算出真实入口文件路径
+ * ✅ 终局加载器（Next 16 + Vercel 稳定）：
+ * - 不使用 require.resolve（避免 Turbopack/打包器静态解析）
+ * - 不出现 "wework-chat-node/lib" 这种子路径字符串（你已经被它坑过）
+ * - 只读取 wework-chat-node/package.json，然后按 pkg.main 拼出绝对入口文件加载
  */
-let _mod: any = null;
+type NodeRequireLike = ((id: string) => any) & { resolve?: (id: string) => string };
 
-function getWeWorkModule(): any {
-  if (_mod) return _mod;
+let _loaded: any = null;
 
-  const req = (eval("require") as any) as (id: string) => any;
+function getReq(): NodeRequireLike {
+  // eval("require")：保证是 runtime require，而不是被打包器改写
+  return (eval("require") as any) as NodeRequireLike;
+}
 
-  // 1) 读取 package.json（这是固定存在的文件）
-  const pkgJsonPath = req("wework-chat-node/package.json") && req.resolve
-    ? req.resolve("wework-chat-node/package.json")
-    : null;
+function loadWeWorkChatNode(): any {
+  if (_loaded) return _loaded;
 
-  // 某些环境下 eval(require) 没有 resolve，我们用 __dirname 相对推断会不可靠；
-  // 所以这里 fallback：直接 require package.json 对象，不依赖 resolve。
-  const pkg = req("wework-chat-node/package.json");
-  const mainRel = (pkg && pkg.main) ? String(pkg.main) : "index.js";
+  const req = getReq();
 
-  // 2) 计算 moduleRoot：优先用 resolve 的绝对路径，否则用 package.json 自身路径推断
-  let moduleRoot: string | null = null;
-  if (pkgJsonPath && typeof pkgJsonPath === "string") {
-    moduleRoot = path.dirname(pkgJsonPath);
+  // 1) 读取 package.json（一定存在）
+  const pkg = req("wework-chat-node/package.json") as { main?: string };
+
+  // 2) 尽量拿到 package.json 的绝对路径（有 resolve 就用 resolve）
+  const pkgJsonAbs =
+    typeof req.resolve === "function"
+      ? req.resolve("wework-chat-node/package.json")
+      : null;
+
+  // 3) 根据 pkg.main 拼出真实入口文件绝对路径加载
+  const mainRel = (pkg?.main ? String(pkg.main) : "index.js").replace(/^\.\//, "");
+
+  if (pkgJsonAbs) {
+    const moduleRoot = path.dirname(pkgJsonAbs);
+    const entryAbs = path.join(moduleRoot, mainRel);
+    _loaded = req(entryAbs);
   } else {
-    // fallback：require("wework-chat-node/package.json") 返回对象没路径，那就只能尝试包根（可能失败）
-    // 但在 Vercel runtime 中通常 req.resolve 是存在的
-    moduleRoot = null;
+    // 极端兜底：没有 resolve 的情况（通常不会发生在 Vercel Node runtime）
+    _loaded = req("wework-chat-node");
   }
 
-  // 3) 优先用绝对路径加载 main，避免 "main 指向不存在的 index.js" 的老坑
-  if (moduleRoot) {
-    const entry = path.join(moduleRoot, mainRel);
-    _mod = req(entry);
-  } else {
-    // 最后兜底：直接包根（如果包 main 正常会成功；如果 main 坏，会和之前一样失败）
-    _mod = req("wework-chat-node");
-  }
-
-  _mod = _mod?.default ?? _mod;
-  return _mod;
+  _loaded = _loaded?.default ?? _loaded;
+  return _loaded;
 }
 
 function env(name: string) {
@@ -58,22 +57,16 @@ function mustEnv(name: string) {
   return v;
 }
 
-/**
- * wework-chat-node 的导出形态各版本可能不同，这里做兼容提取
- */
 function getCtor(mod: any) {
-  // 常见形态：module.exports = WeWorkChat
   if (typeof mod === "function") return mod;
-  // 或 { WeWorkChat: ... }
   if (mod?.WeWorkChat) return mod.WeWorkChat;
-  // 或 { default: ... }
   if (typeof mod?.default === "function") return mod.default;
   if (mod?.default?.WeWorkChat) return mod.default.WeWorkChat;
   return null;
 }
 
 function getClient() {
-  const mod = getWeWorkModule();
+  const mod = loadWeWorkChatNode();
   const Ctor = getCtor(mod);
   if (!Ctor) {
     const keys = Object.keys(mod || {});
@@ -81,6 +74,8 @@ function getClient() {
   }
 
   const corpId = mustEnv("WECOM_CORP_ID");
+
+  // ✅ 统一：优先 WECOM_CORP_SECRET，兼容旧变量
   const secret = env("WECOM_CORP_SECRET") || env("WECOM_MSG_ARCHIVE_SECRET");
   if (!secret) throw new Error("missing env: WECOM_CORP_SECRET");
 
@@ -102,10 +97,8 @@ export async function wecomPullChatData(args: {
 }): Promise<{ pulled: number; nextSeq: number; items: any[] }> {
   const client: any = getClient();
 
-  // 兼容两种 API：
-  // - client.getChatData({seq,limit,timeout}) -> Promise
-  // - client.getChatData(seq,limit,timeout, cb)
   const res = await (async () => {
+    // 常见：Promise 版
     if (typeof client.getChatData === "function" && client.getChatData.length <= 1) {
       return await client.getChatData({
         seq: args.seq,
@@ -113,6 +106,7 @@ export async function wecomPullChatData(args: {
         timeout: args.timeout,
       });
     }
+    // 兼容 callback 版
     return await new Promise<any>((resolve, reject) => {
       client.getChatData(args.seq, args.limit, args.timeout, (err: any, data: any) => {
         if (err) return reject(err);
@@ -127,14 +121,9 @@ export async function wecomPullChatData(args: {
 
   const items = res?.chatdata ?? res?.items ?? [];
   const nextSeq = items.length ? items[items.length - 1].seq : args.seq;
-
   return { pulled: items.length, nextSeq, items };
 }
 
-/**
- * 解密单条 chatdata（你 route.ts 里会用它做 firstPreview）
- * 这里提供一个不依赖 SDK 的纯 JS 解密（若 SDK 自带 decrypt 也可改用 SDK）
- */
 export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
   const encRandomKeyB64 = item.encrypt_random_key;
   const encChatMsgB64 = item.encrypt_chat_msg;
@@ -144,10 +133,7 @@ export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
   }
 
   const randomKey = crypto.privateDecrypt(
-    {
-      key: rsaPrivateKeyPem,
-      padding: crypto.constants.RSA_PKCS1_PADDING,
-    },
+    { key: rsaPrivateKeyPem, padding: crypto.constants.RSA_PKCS1_PADDING },
     Buffer.from(encRandomKeyB64, "base64")
   );
 
@@ -160,6 +146,5 @@ export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
     decipher.final(),
   ]);
 
-  const text = plain.toString("utf8").trim();
-  return JSON.parse(text);
+  return JSON.parse(plain.toString("utf8").trim());
 }
