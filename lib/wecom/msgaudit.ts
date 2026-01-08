@@ -38,7 +38,6 @@ function ensureSymlink(linkPath: string, targetPath: string) {
   try {
     const st = fs.lstatSync(linkPath);
     if (st.isSymbolicLink()) return;
-    // exists but not symlink -> don't break
     return;
   } catch {
     // not exist
@@ -52,8 +51,8 @@ function ensureSymlink(linkPath: string, targetPath: string) {
 
 /**
  * Runtime shim for native binaries:
- * If native contains an absolute prefix like "/tmp/vercelp0/node_modules/...",
- * ensure "/tmp/vercelp0/node_modules" points to "/var/task/node_modules".
+ * Some native builds embed absolute prefix like "/tmp/vercelp0/node_modules/..."
+ * Ensure "/tmp/vercelp0/node_modules" points to "/var/task/node_modules".
  */
 function ensureVercelPathShim() {
   if (process.platform !== "linux") return;
@@ -82,7 +81,35 @@ function ensureLdLibraryPath(moduleRoot: string) {
 }
 
 /**
- * Avoid any bundler weirdness around require.resolve by using filesystem path under /var/task.
+ * Critical: native SDK (libcurl/OpenSSL) needs a CA bundle for TLS.
+ * Node's NODE_OPTIONS does NOT affect native SDK.
+ */
+function ensureNativeCaBundle() {
+  if (process.platform !== "linux") return;
+
+  // Do not override if user explicitly set it.
+  if (process.env.SSL_CERT_FILE || process.env.CURL_CA_BUNDLE) return;
+
+  const candidates = [
+    "/etc/ssl/certs/ca-certificates.crt",      // Debian/Ubuntu (often present)
+    "/etc/pki/tls/certs/ca-bundle.crt",        // RHEL/CentOS
+    "/etc/ssl/ca-bundle.pem",                  // some distros
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+  ];
+
+  const found = candidates.find((p) => safeExists(p));
+  if (found) {
+    process.env.SSL_CERT_FILE = found;
+    process.env.CURL_CA_BUNDLE = found;
+    // Some libcurl builds also honor SSL_CERT_DIR; harmless if set.
+    if (!process.env.SSL_CERT_DIR && safeExists("/etc/ssl/certs")) {
+      process.env.SSL_CERT_DIR = "/etc/ssl/certs";
+    }
+  }
+}
+
+/**
+ * Avoid bundler weirdness around require.resolve by using filesystem path under /var/task.
  */
 function findWeworkPkgJsonByFs() {
   const base = process.cwd(); // /var/task
@@ -94,17 +121,15 @@ function findWeworkPkgJsonByFs() {
 function loadWeWork() {
   if (cached) return cached;
 
-  // Make sure /tmp shim exists before loading native.
+  // Must be set BEFORE loading native module.
+  ensureNativeCaBundle();
   ensureVercelPathShim();
 
-  // Locate module root (stable on Vercel serverless).
   const pkgJsonPath = findWeworkPkgJsonByFs();
   const moduleRoot = path.dirname(pkgJsonPath);
 
-  // Make sure .so dir is in loader search path.
   ensureLdLibraryPath(moduleRoot);
 
-  // Load CJS module. Some builds export default.
   const mod = require("wework-chat-node");
   cached = mod?.default ? mod.default : mod;
 
@@ -121,7 +146,7 @@ export async function wecomPullChatData(args: {
 }) {
   const corpId = mustEnv("WECOM_CORP_ID");
 
-  // ✅ Prefer msg-archive secret (avoid semantic confusion)
+  // Prefer archive secret (clear semantics)
   const secret =
     env("WECOM_MSG_ARCHIVE_SECRET") || env("WECOM_CORP_SECRET") || "";
   if (!secret) {
@@ -136,17 +161,15 @@ export async function wecomPullChatData(args: {
   const { WeWorkChat } = loadWeWork();
   const client = new WeWorkChat({ corpId, secret, privateKey });
 
-  // Call SDK
   const res = await client.getChatData({
     seq: args.seq,
     limit: args.limit,
     timeout: args.timeout,
   });
 
-  // Some wrappers expose errcode/errmsg; surface them if present.
+  // If wrapper exposes errcode/errmsg, surface it (harmless if absent).
   const errcode = (res as any)?.errcode;
   const errmsg = (res as any)?.errmsg;
-
   if (errcode !== undefined && Number(errcode) !== 0) {
     throw new Error(
       `getchatdata failed: errcode=${errcode} errmsg=${String(errmsg || "")
@@ -167,10 +190,11 @@ export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
   const encRandomKeyB64 = item?.encrypt_random_key;
   const encChatMsgB64 = item?.encrypt_chat_msg;
   if (!encRandomKeyB64 || !encChatMsgB64) {
-    throw new Error("invalid chatdata item: missing encrypt_random_key/encrypt_chat_msg");
+    throw new Error(
+      "invalid chatdata item: missing encrypt_random_key/encrypt_chat_msg"
+    );
   }
 
-  // 1) RSA decrypt randomKey
   const randomKey = crypto.privateDecrypt(
     {
       key: rsaPrivateKeyPem,
@@ -179,7 +203,6 @@ export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
     Buffer.from(encRandomKeyB64, "base64")
   );
 
-  // 2) AES decrypt
   const aesKey = crypto.createHash("sha256").update(randomKey).digest();
   const iv = crypto.createHash("md5").update(randomKey).digest();
 
