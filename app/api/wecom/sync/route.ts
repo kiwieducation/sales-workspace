@@ -1,8 +1,8 @@
 // app/api/wecom/sync/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import path from "path";
-import fs from "fs";
 import { createRequire } from "module";
+import nodePath from "path";
+import fs from "fs";
 import { wecomPullChatData } from "@/lib/wecom/msgaudit";
 
 export const runtime = "nodejs";
@@ -15,8 +15,6 @@ function bearerToken(req: NextRequest) {
 }
 
 function expectedToken() {
-  // 保持兼容：你现在用的 token 可以放在 WECOM_SYNC_TOKEN
-  // 如果你之前项目里叫别的，也支持几个常见名字，不引入新体系
   return (
     (process.env.WECOM_SYNC_TOKEN || "").trim() ||
     (process.env.WECOM_SYNC_BEARER_TOKEN || "").trim() ||
@@ -33,17 +31,8 @@ function checkAuth(req: NextRequest) {
 function ensureLdLibraryPath(libDir: string) {
   const cur = (process.env.LD_LIBRARY_PATH || "").trim();
   const parts = cur.split(":").filter(Boolean);
-
   if (!parts.includes(libDir)) {
     process.env.LD_LIBRARY_PATH = [libDir, ...parts].join(":");
-  }
-}
-
-function safeListDir(dir: string) {
-  try {
-    return fs.readdirSync(dir);
-  } catch {
-    return [];
   }
 }
 
@@ -56,48 +45,22 @@ function fileExists(p: string) {
   }
 }
 
+function listDirSafe(dir: string) {
+  try {
+    return fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 function num(v: any, fallback: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
 
-/**
- * diag：验证 Vercel Serverless 上 native 包是否真的在 /var/task/node_modules
- * 并确保 LD_LIBRARY_PATH 包含 wework-chat-node/lib
- */
 function runNativeDiag() {
-  let diagError: string | null = null;
-
-  let pkgJsonPath = "";
-  let moduleRoot = "";
-  let libDir = "";
-  let soPath = "";
-  let soExists = false;
-  let libFiles: string[] = [];
-  let hasWeWorkChatExport: boolean | null = null;
-
-  try {
-    pkgJsonPath = require.resolve("wework-chat-node/package.json");
-    moduleRoot = path.dirname(pkgJsonPath);
-    libDir = path.join(moduleRoot, "lib");
-
-    ensureLdLibraryPath(libDir);
-
-    // 这个 so 名字是 wework-chat-node 常见的 SDK so（你之前 diag 里就是它）
-    soPath = path.join(libDir, "libWeWorkFinanceSdk_C.so");
-    soExists = fileExists(soPath);
-    libFiles = safeListDir(libDir);
-
-    // 尝试 require 包本体，验证导出（会触发 .node 加载）
-    // 失败也不要影响 diag 返回，只记录 diagError
-    const mod = require("wework-chat-node");
-    const resolved = mod?.default ? mod.default : mod;
-    hasWeWorkChatExport = Boolean(resolved?.WeWorkChat);
-  } catch (e: any) {
-    diagError = e?.message || String(e);
-  }
-
-  return {
+  // 任何情况下都返回 JSON，不让 diag 本身炸 500
+  const out: any = {
     runtime: {
       node: process.version.replace(/^v/, ""),
       platform: process.platform,
@@ -106,16 +69,52 @@ function runNativeDiag() {
     ldLibraryPath: process.env.LD_LIBRARY_PATH || "",
     paths: {
       cwd: process.cwd(),
-      pkgJsonPath,
-      moduleRoot,
-      libDir,
-      soPath,
-      soExists,
-      libFiles,
-      hasWeWorkChatExport,
+      pkgJsonPath: "",
+      moduleRoot: "",
+      libDir: "",
+      soPath: "",
+      soExists: false,
+      libFiles: [] as string[],
+      hasWeWorkChatExport: null as null | boolean,
     },
-    diagError,
+    diagError: null as null | string,
   };
+
+  try {
+    // ✅ 强制字符串化，杜绝 number 混入
+    const pkgJsonPath = String(
+      require.resolve("wework-chat-node/package.json")
+    );
+    out.paths.pkgJsonPath = pkgJsonPath;
+
+    const moduleRoot = nodePath.dirname(pkgJsonPath);
+    out.paths.moduleRoot = moduleRoot;
+
+    const libDir = nodePath.join(moduleRoot, "lib");
+    out.paths.libDir = libDir;
+
+    ensureLdLibraryPath(libDir);
+    out.ldLibraryPath = process.env.LD_LIBRARY_PATH || "";
+
+    const soPath = nodePath.join(libDir, "libWeWorkFinanceSdk_C.so");
+    out.paths.soPath = soPath;
+    out.paths.soExists = fileExists(soPath);
+    out.paths.libFiles = listDirSafe(libDir);
+
+    // 触发加载 native addon（如果失败也不炸，只记录错误）
+    try {
+      const mod = require("wework-chat-node");
+      const resolved = mod?.default ? mod.default : mod;
+      out.paths.hasWeWorkChatExport = Boolean(resolved?.WeWorkChat);
+    } catch (e: any) {
+      out.paths.hasWeWorkChatExport = false;
+      out.diagError = out.diagError || (e?.message || String(e));
+    }
+  } catch (e: any) {
+    out.diagError = e?.message || String(e);
+  }
+
+  return out;
 }
 
 export async function POST(req: NextRequest) {
@@ -129,13 +128,11 @@ export async function POST(req: NextRequest) {
 
     const body = await req.json().catch(() => ({}));
 
-    // diag 模式：不依赖企业微信 env，不落盘，只做 native 诊断
     if (body?.diag === true) {
       const diag = runNativeDiag();
       return NextResponse.json({ ok: true, diag: true, ...diag });
     }
 
-    // 参数解析：显式 number 化（避免任何奇怪类型传递）
     const seq = num(body?.seq ?? 0, 0);
     const limit = num(body?.maxResults ?? body?.limit ?? 10, 10);
     const timeout = num(body?.timeout ?? 10, 10);
@@ -159,17 +156,11 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ✅ 不写 /var/task，不 mkdir，不落盘
-    const result = await wecomPullChatData({
-      seq,
-      limit,
-      timeout,
-    });
-
+    // ✅ 不写盘 / 不 mkdir / 不碰 /var/task
+    const result = await wecomPullChatData({ seq, limit, timeout });
     return NextResponse.json({ ok: true, ...result });
   } catch (err: any) {
     console.error("[wecom-sync] error:", err);
-
     return NextResponse.json(
       {
         ok: false,
