@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
 // Postinstall hardening for wework-chat-node on Vercel Serverless.
-// Goals:
-// 1) Copy build/Release/wework.node -> compiled/<patch>/linux/x64/wework.node (patch window)
-// 2) Purge build-time absolute prefix "/vercel/path0" from ALL native binaries.
-// 3) ALSO patch any traced/copied native binaries under project output (e.g. .next/**),
-//    because the runtime may load a copied artifact instead of the original node_modules file.
+// 1) Copy build/Release/wework.node -> compiled/<patch>/linux/x64/wework.node
+// 2) Patch absolute build prefix in ALL native binaries to a writable runtime shim prefix:
+//    "/vercel/path0"  -> "/tmp/vercelp0"  (same length, no NUL truncation)
+//    "/var/task\0\0\0\0" -> "/tmp/vercelp0" (repair previous NUL-padded patch)
 // Always exit(0) within 12s.
 
 const fs = require("fs");
@@ -45,67 +44,51 @@ function moduleRoot(name) {
   return path.dirname(p);
 }
 
-// Binary-safe equal-length replacement (NUL padded).
-function replaceInBinary(filePath, fromStr, toStr) {
-  try {
-    const buf = fs.readFileSync(filePath);
-    const from = Buffer.from(fromStr, "utf8");
-    const toRaw = Buffer.from(toStr, "utf8");
-
-    if (toRaw.length > from.length) return false;
-    const to = Buffer.concat([toRaw, Buffer.alloc(from.length - toRaw.length, 0)]);
-
-    let replaced = false;
-    for (let i = 0; i <= buf.length - from.length; i++) {
-      let match = true;
-      for (let j = 0; j < from.length; j++) {
-        if (buf[i + j] !== from[j]) {
-          match = false;
-          break;
-        }
-      }
-      if (match) {
-        to.copy(buf, i);
-        replaced = true;
-        i += from.length - 1;
-      }
-    }
-
-    if (replaced) {
-      fs.writeFileSync(filePath, buf);
-      log("patched:", filePath, `${fromStr} -> ${toStr}`);
-    }
-    return replaced;
-  } catch {
-    return false;
-  }
-}
-
-function walkFiles(dir, pred, out = [], max = 4000) {
+function walkFiles(dir, pred, out = [], max = 6000) {
   if (out.length >= max) return out;
   try {
     const ents = fs.readdirSync(dir, { withFileTypes: true });
     for (const e of ents) {
       if (out.length >= max) break;
       const p = path.join(dir, e.name);
-
-      // skip huge dirs
-      if (e.isDirectory()) {
-        if (
-          e.name === ".git" ||
-          e.name === ".turbo" ||
-          e.name === ".cache" ||
-          e.name === "node_modules" // avoid double scan here; we scan target module separately
-        ) {
-          continue;
-        }
-        walkFiles(p, pred, out, max);
-      } else if (e.isFile() && pred(p)) {
-        out.push(p);
-      }
+      if (e.isDirectory()) walkFiles(p, pred, out, max);
+      else if (e.isFile() && pred(p)) out.push(p);
     }
   } catch {}
   return out;
+}
+
+// Replace equal-length byte sequences in a binary file (no NUL padding, no truncation).
+function replaceBytesInFile(filePath, fromBuf, toBuf) {
+  try {
+    if (fromBuf.length !== toBuf.length) return 0;
+
+    const buf = fs.readFileSync(filePath);
+    let hits = 0;
+
+    for (let i = 0; i <= buf.length - fromBuf.length; i++) {
+      let match = true;
+      for (let j = 0; j < fromBuf.length; j++) {
+        if (buf[i + j] !== fromBuf[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        toBuf.copy(buf, i);
+        hits++;
+        i += fromBuf.length - 1;
+      }
+    }
+
+    if (hits > 0) {
+      fs.writeFileSync(filePath, buf);
+      log("patched:", filePath, `hits=${hits}`);
+    }
+    return hits;
+  } catch {
+    return 0;
+  }
 }
 
 const timer = setTimeout(() => {
@@ -115,11 +98,6 @@ const timer = setTimeout(() => {
 
 try {
   log("postinstall start");
-
-  const fromStr = "/vercel/path0";
-  const toStr = "/var/task";
-  let patchedCount = 0;
-
   const root = moduleRoot("wework-chat-node");
 
   // 1) Copy wework.node across patch window
@@ -141,75 +119,60 @@ try {
       vers.add(String(nodeV));
     }
 
-    // ensure current build/runtime patches you may hit
+    // runtime patches you observed
     vers.add("20.19.5");
     vers.add("20.19.6");
 
     let copied = 0;
-    const sample = [];
     for (const v of vers) {
       const dst = path.join(root, "compiled", v, "linux", "x64", "wework.node");
-      if (copy(srcNode, dst)) {
-        copied++;
-        if (sample.length < 10) sample.push(dst);
-      }
+      if (copy(srcNode, dst)) copied++;
     }
-    log("copied wework.node:");
-    log("  from:", srcNode);
-    log("  sample to:", sample);
-    log("  total copies:", copied);
+
+    log("copied wework.node total:", copied);
   } else {
     log("no wework.node in build/, skip copy");
   }
 
-  // 2) Patch within wework-chat-node itself (lib/*.so + build/**/*.node + compiled/**/*.node)
+  // 2) Patch absolute prefix in ALL native binaries
+  const toBuf = Buffer.from("/tmp/vercelp0", "utf8"); // length 13
+
+  const from1 = Buffer.from("/vercel/path0", "utf8"); // length 13
+  // previous bad patch pattern: "/var/task" + 4 NULs (length 13)
+  const from2 = Buffer.concat([Buffer.from("/var/task", "utf8"), Buffer.alloc(4, 0)]);
+
+  let patchedFiles = 0;
+  let totalHits = 0;
+
+  const targets = [];
+
   const libDir = path.join(root, "lib");
   if (exists(libDir)) {
-    const soFiles = fs
-      .readdirSync(libDir)
-      .filter((f) => f.endsWith(".so"))
-      .map((f) => path.join(libDir, f));
-    for (const f of soFiles) if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
-  }
-
-  const buildDir = path.join(root, "build");
-  if (exists(buildDir)) {
-    const nodeFiles = walkFiles(buildDir, (p) => p.endsWith(".node"), [], 2000);
-    for (const f of nodeFiles) if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
-  }
-
-  const compiledDir = path.join(root, "compiled");
-  if (exists(compiledDir)) {
-    const compiledNodes = walkFiles(compiledDir, (p) => p.endsWith(".node"), [], 4000);
-    for (const f of compiledNodes) if (replaceInBinary(f, fromStr, toStr)) patchedCount++;
-  }
-
-  log("module patch done. patched files:", patchedCount);
-
-  // 3) EXTRA: Patch any traced/copied native binaries in output dirs (.next/** etc)
-  // This covers the case where Vercel runtime loads a copied artifact rather than node_modules.
-  let extraPatched = 0;
-  const cwd = process.cwd();
-
-  // only scan a few likely dirs to stay fast
-  const scanRoots = [
-    path.join(cwd, ".next"),
-    path.join(cwd, ".vercel"), // sometimes contains output traces
-  ].filter(exists);
-
-  for (const sr of scanRoots) {
-    const natives = walkFiles(
-      sr,
-      (p) => p.endsWith(".node") || p.endsWith(".so"),
-      [],
-      2000
-    );
-    for (const f of natives) {
-      if (replaceInBinary(f, fromStr, toStr)) extraPatched++;
+    for (const f of fs.readdirSync(libDir)) {
+      if (f.endsWith(".so")) targets.push(path.join(libDir, f));
     }
   }
 
-  log("output patch done. patched files:", extraPatched);
+  const buildDir = path.join(root, "build");
+  if (exists(buildDir)) targets.push(...walkFiles(buildDir, (p) => p.endsWith(".node")));
+
+  const compiledDir = path.join(root, "compiled");
+  if (exists(compiledDir)) targets.push(...walkFiles(compiledDir, (p) => p.endsWith(".node")));
+
+  // de-dup
+  const uniq = Array.from(new Set(targets));
+
+  for (const f of uniq) {
+    const h1 = replaceBytesInFile(f, from1, toBuf);
+    const h2 = replaceBytesInFile(f, from2, toBuf);
+    const hits = h1 + h2;
+    if (hits > 0) {
+      patchedFiles++;
+      totalHits += hits;
+    }
+  }
+
+  log("absolute prefix patch done.", { patchedFiles, totalHits });
 } catch (e) {
   log("ERROR (ignored):", e && e.stack ? e.stack : e);
 } finally {

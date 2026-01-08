@@ -17,38 +17,55 @@ function mustEnv(name: string) {
   return v;
 }
 
-function safeExists(p: unknown) {
+function safeExists(p: string) {
   try {
-    const s = String(p ?? "");
-    if (!s) return false;
-    fs.accessSync(s, fs.constants.R_OK);
+    fs.accessSync(p, fs.constants.R_OK);
     return true;
   } catch {
     return false;
   }
 }
 
+function ensureDir(p: string) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function ensureSymlink(linkPath: string, targetPath: string) {
+  try {
+    const st = fs.lstatSync(linkPath);
+    if (st.isSymbolicLink()) return;
+    // if it exists but not symlink, leave it (don’t break)
+    return;
+  } catch {
+    // not exist
+  }
+  try {
+    fs.symlinkSync(targetPath, linkPath, "dir");
+  } catch {
+    // ignore
+  }
+}
+
 /**
- * 终局：不要用 require.resolve 定位包路径（会被 webpack 替换成数字 module id）
- * 用 fs 从 cwd 向上找 /node_modules/wework-chat-node/package.json
+ * Runtime shim:
+ * Native binaries will reference "/tmp/vercelp0/node_modules/..."
+ * Create /tmp/vercelp0 and symlink node_modules -> /var/task/node_modules
  */
-function findWeworkPkgJsonByFs() {
-  const candidates: string[] = [];
+function ensureVercelPathShim() {
+  if (process.platform !== "linux") return;
 
-  let cur = process.cwd();
-  for (let i = 0; i < 8; i++) {
-    candidates.push(path.join(cur, "node_modules", "wework-chat-node", "package.json"));
-    candidates.push(path.join(cur, "node_modules", ".pnpm", "wework-chat-node", "package.json"));
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
+  const shimRoot = "/tmp/vercelp0";
+  const shimNodeModules = path.join(shimRoot, "node_modules");
+  const realNodeModules = path.join(process.cwd(), "node_modules"); // /var/task/node_modules
+
+  try {
+    ensureDir(shimRoot);
+    if (safeExists(realNodeModules)) {
+      ensureSymlink(shimNodeModules, realNodeModules);
+    }
+  } catch {
+    // ignore
   }
-
-  for (const p of candidates) {
-    if (safeExists(p)) return p;
-  }
-
-  throw new Error(`wework-chat-node package.json not found via fs`);
 }
 
 function ensureLdLibraryPath(moduleRoot: string) {
@@ -60,12 +77,24 @@ function ensureLdLibraryPath(moduleRoot: string) {
   }
 }
 
+function findWeworkPkgJsonByFs() {
+  const base = process.cwd(); // /var/task
+  const p = path.join(base, "node_modules", "wework-chat-node", "package.json");
+  if (safeExists(p)) return p;
+  throw new Error("wework-chat-node package.json not found under /var/task/node_modules");
+}
+
 function loadWeWork() {
   if (cached) return cached;
 
+  // ✅ ensure shim first
+  ensureVercelPathShim();
+
+  // ✅ resolve moduleRoot via fs (avoid require.resolve numeric id issue)
   const pkgJsonPath = findWeworkPkgJsonByFs();
   const moduleRoot = path.dirname(pkgJsonPath);
 
+  // ✅ LD_LIBRARY_PATH must include lib dir
   ensureLdLibraryPath(moduleRoot);
 
   const mod = require("wework-chat-node");
