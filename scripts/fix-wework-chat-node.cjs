@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 /* scripts/fix-wework-chat-node.cjs
  *
- * Fast + safe workaround for Vercel Build/Runtime Node patch drift
- * with native addon loader path: compiled/<nodeVer>/linux/x64/wework.node
- *
- * - Small patch window only (avoid IO explosion / 45min build risk)
- * - Hard timeout, always exit(0)
- * - Force linux/x64 targets on Vercel to match /var/task runtime
+ * Goal (Vercel-stable):
+ * 1) Patch Vercel Build/Runtime Node patch drift for native addon loader path:
+ *      node_modules/wework-chat-node/compiled/<nodeVer>/linux/x64/wework.node
+ * 2) Avoid IO explosion (no 0..40, no minor spread); keep copies small.
+ * 3) Never break install: hard timeout + always exit(0).
+ * 4) Print ldd on libWeWorkFinanceSdk_C.so to diagnose missing shared libs.
  */
 
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 function log(...args) {
   console.log("[wework-chat-node]", ...args);
@@ -26,7 +27,9 @@ function exists(p) {
 }
 
 function ensureDir(p) {
-  fs.mkdirSync(p, { recursive: true });
+  try {
+    fs.mkdirSync(p, { recursive: true });
+  } catch {}
 }
 
 function safeCopy(src, dst) {
@@ -63,87 +66,85 @@ function main() {
 
   const moduleRoot = getModuleRoot("wework-chat-node");
 
-  // Find source binding
+  // 1) Find built addon (.node)
   const srcCandidates = [
     path.join(moduleRoot, "build", "Release", "wework.node"),
     path.join(moduleRoot, "build", "Debug", "wework.node"),
   ];
-  const src = srcCandidates.find(exists);
+  const srcNode = srcCandidates.find(exists);
 
-  if (!src) {
+  if (!srcNode) {
     log("no native binding found, skip");
     log("tried:", srcCandidates);
-    return;
   }
 
+  // 2) Copy .node into compiled/<ver>/linux/x64 with small patch window
   const nodeV = process.versions.node; // build env node version
   const parsed = parseNodeVersion(nodeV);
 
-  // On Vercel, runtime is linux/x64 in /var/task.
-  // Force targets to linux/x64 so paths match what the loader will look for.
-  const onVercel = !!process.env.VERCEL;
-  const platform = onVercel ? "linux" : process.platform;
-  const arch = onVercel ? "x64" : process.arch;
+  const platform = "linux"; // force for Vercel runtime
+  const arch = "x64";       // force for Vercel runtime
 
   const targetVersions = new Set();
 
-  // Always include current build node (exact)
   if (parsed) {
     targetVersions.add(`${parsed.major}.${parsed.minor}.${parsed.patch}`);
-
-    // Patch window: (patch-2..patch+6) capped at >=0
+    // patch window: -2..+6 (max 9)
     for (let p = Math.max(0, parsed.patch - 2); p <= parsed.patch + 6; p++) {
       targetVersions.add(`${parsed.major}.${parsed.minor}.${p}`);
     }
-
-    // Known runtime drift anchor(s) you observed
-    // Keep small, but include ±1 around it to survive tiny pool changes.
-    const known = { major: 20, minor: 19, patch: 5 };
-    if (parsed.major === known.major && parsed.minor === known.minor) {
-      for (let p = Math.max(0, known.patch - 1); p <= known.patch + 1; p++) {
-        targetVersions.add(`${known.major}.${known.minor}.${p}`);
-      }
-    } else {
-      // still add the exact known runtime patch anyway
-      targetVersions.add("20.19.5");
-      targetVersions.add("20.19.6");
-    }
   } else if (nodeV) {
     targetVersions.add(String(nodeV));
-    // Still add known runtime patch
-    targetVersions.add("20.19.5");
-    targetVersions.add("20.19.6");
   }
 
-  // Optional hints (usually empty, but harmless)
+  // Known runtime patch you already observed
+  targetVersions.add("20.19.5");
+
+  // Optional hints
   for (const v of [process.env.VERCEL_NODE_VERSION, process.env.NODE_VERSION].filter(Boolean)) {
     targetVersions.add(String(v));
   }
 
-  let copied = 0;
-  const targets = [];
+  let copiedNode = 0;
+  const sampleTargets = [];
 
-  for (const ver of targetVersions) {
-    const dst = path.join(moduleRoot, "compiled", ver, platform, arch, "wework.node");
-    if (safeCopy(src, dst)) {
-      copied++;
-      targets.push(dst);
+  if (srcNode) {
+    for (const ver of targetVersions) {
+      const dst = path.join(moduleRoot, "compiled", ver, platform, arch, "wework.node");
+      if (safeCopy(srcNode, dst)) {
+        copiedNode++;
+        if (sampleTargets.length < 12) sampleTargets.push(dst);
+      }
+    }
+    // ensure build/Release exists
+    const releaseTarget = path.join(moduleRoot, "build", "Release", "wework.node");
+    if (!exists(releaseTarget)) {
+      if (safeCopy(srcNode, releaseTarget)) copiedNode++;
     }
   }
 
-  // Ensure build/Release exists (some packages expect it)
-  const releaseTarget = path.join(moduleRoot, "build", "Release", "wework.node");
-  if (!exists(releaseTarget)) {
-    if (safeCopy(src, releaseTarget)) {
-      copied++;
-      targets.push(releaseTarget);
-    }
-  }
+  // 3) Ensure Finance SDK .so is present (should come with package)
+  const soPath = path.join(moduleRoot, "lib", "libWeWorkFinanceSdk_C.so");
+  const soExists = exists(soPath);
 
   log("fixed:");
-  log("  from:", src);
-  log("  sample to:", targets.slice(0, 12));
-  log("  total copies:", copied);
+  if (srcNode) log("  node from:", srcNode);
+  log("  node sample to:", sampleTargets);
+  log("  node total copies:", copiedNode);
+  log("  finance so:", soPath, soExists ? "(exists)" : "(MISSING)");
+
+  // 4) ldd diagnostics (do not fail build)
+  try {
+    if (soExists) {
+      log("ldd:", soPath);
+      const out = execSync(`ldd "${soPath}" || true`, { stdio: "pipe" }).toString();
+      console.log(out);
+    } else {
+      log("ldd skip: finance so not found");
+    }
+  } catch (e) {
+    log("ldd failed (ignored):", e && e.message ? e.message : e);
+  }
 }
 
 try {
