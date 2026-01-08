@@ -4,14 +4,12 @@ const nextConfig = {
   serverExternalPackages: ["wework-chat-node"],
 
   // ✅ 关键兜底：强制把 native 文件带进 serverless 函数包（/var/task）
-  experimental: {
-    outputFileTracingIncludes: {
-      // 你的实际路由（很多情况下这个就够）
-      "/api/wecom/sync": ["./node_modules/wework-chat-node/**"],
+  outputFileTracingIncludes: {
+    // 你的实际路由（从 build 输出看到是 ƒ /api/wecom/sync）
+    "/api/wecom/sync": ["./node_modules/wework-chat-node/**"],
 
-      // App Router 某些版本/场景会用 route 作为 key（加上更稳）
-      "/api/wecom/sync/route": ["./node_modules/wework-chat-node/**"],
-    },
+    // 额外兜底：某些情况下 route key 会被用到（加了不亏）
+    "/api/wecom/sync/route": ["./node_modules/wework-chat-node/**"],
   },
 };
 
