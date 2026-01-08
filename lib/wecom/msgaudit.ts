@@ -9,7 +9,7 @@ function getWework(): WeWorkChatNodeModule {
 
   // ✅ 关键：用 eval("require") 避免 Next/Turbopack 静态分析并内联到 .next
   const req = (eval("require") as any) as (id: string) => any;
-  const mod = req("wework-chat-node");
+  const mod = req("wework-chat-node/lib");
 
   _wework = mod?.default ?? mod;
   return _wework;
