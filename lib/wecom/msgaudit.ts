@@ -27,14 +27,18 @@ function safeExists(p: string) {
 }
 
 function ensureDir(p: string) {
-  fs.mkdirSync(p, { recursive: true });
+  try {
+    fs.mkdirSync(p, { recursive: true });
+  } catch {
+    // ignore
+  }
 }
 
 function ensureSymlink(linkPath: string, targetPath: string) {
   try {
     const st = fs.lstatSync(linkPath);
     if (st.isSymbolicLink()) return;
-    // if it exists but not symlink, leave it (don’t break)
+    // exists but not symlink -> don't break
     return;
   } catch {
     // not exist
@@ -47,9 +51,9 @@ function ensureSymlink(linkPath: string, targetPath: string) {
 }
 
 /**
- * Runtime shim:
- * Native binaries will reference "/tmp/vercelp0/node_modules/..."
- * Create /tmp/vercelp0 and symlink node_modules -> /var/task/node_modules
+ * Runtime shim for native binaries:
+ * If native contains an absolute prefix like "/tmp/vercelp0/node_modules/...",
+ * ensure "/tmp/vercelp0/node_modules" points to "/var/task/node_modules".
  */
 function ensureVercelPathShim() {
   if (process.platform !== "linux") return;
@@ -77,6 +81,9 @@ function ensureLdLibraryPath(moduleRoot: string) {
   }
 }
 
+/**
+ * Avoid any bundler weirdness around require.resolve by using filesystem path under /var/task.
+ */
 function findWeworkPkgJsonByFs() {
   const base = process.cwd(); // /var/task
   const p = path.join(base, "node_modules", "wework-chat-node", "package.json");
@@ -87,16 +94,17 @@ function findWeworkPkgJsonByFs() {
 function loadWeWork() {
   if (cached) return cached;
 
-  // ✅ ensure shim first
+  // Make sure /tmp shim exists before loading native.
   ensureVercelPathShim();
 
-  // ✅ resolve moduleRoot via fs (avoid require.resolve numeric id issue)
+  // Locate module root (stable on Vercel serverless).
   const pkgJsonPath = findWeworkPkgJsonByFs();
   const moduleRoot = path.dirname(pkgJsonPath);
 
-  // ✅ LD_LIBRARY_PATH must include lib dir
+  // Make sure .so dir is in loader search path.
   ensureLdLibraryPath(moduleRoot);
 
+  // Load CJS module. Some builds export default.
   const mod = require("wework-chat-node");
   cached = mod?.default ? mod.default : mod;
 
@@ -106,10 +114,21 @@ function loadWeWork() {
   return cached;
 }
 
-export async function wecomPullChatData(args: { seq: number; limit: number; timeout: number }) {
+export async function wecomPullChatData(args: {
+  seq: number;
+  limit: number;
+  timeout: number;
+}) {
   const corpId = mustEnv("WECOM_CORP_ID");
-  const secret = env("WECOM_CORP_SECRET") || env("WECOM_MSG_ARCHIVE_SECRET");
-  if (!secret) throw new Error("missing env: WECOM_CORP_SECRET");
+
+  // ✅ Prefer msg-archive secret (avoid semantic confusion)
+  const secret =
+    env("WECOM_MSG_ARCHIVE_SECRET") || env("WECOM_CORP_SECRET") || "";
+  if (!secret) {
+    throw new Error(
+      "missing env: WECOM_MSG_ARCHIVE_SECRET (preferred) or WECOM_CORP_SECRET"
+    );
+  }
 
   const privateKeyPemRaw = mustEnv("WECOM_MSG_ARCHIVE_PRIVATE_KEY");
   const privateKey = privateKeyPemRaw.replace(/\\n/g, "\n");
@@ -117,18 +136,29 @@ export async function wecomPullChatData(args: { seq: number; limit: number; time
   const { WeWorkChat } = loadWeWork();
   const client = new WeWorkChat({ corpId, secret, privateKey });
 
+  // Call SDK
   const res = await client.getChatData({
     seq: args.seq,
     limit: args.limit,
     timeout: args.timeout,
   });
 
-  const items = res?.chatdata ?? [];
-  const nextSeq = items.length ? Number(items[items.length - 1]?.seq ?? args.seq) : args.seq;
+  // Some wrappers expose errcode/errmsg; surface them if present.
+  const errcode = (res as any)?.errcode;
+  const errmsg = (res as any)?.errmsg;
 
-  if (res?.errcode && res.errcode !== 0) {
-    throw new Error(`getchatdata failed: ${res.errcode} ${res.errmsg || ""}`.trim());
+  if (errcode !== undefined && Number(errcode) !== 0) {
+    throw new Error(
+      `getchatdata failed: errcode=${errcode} errmsg=${String(errmsg || "")
+        .trim()
+        .slice(0, 500)}`
+    );
   }
+
+  const items = (res as any)?.chatdata ?? [];
+  const nextSeq = items.length
+    ? Number(items[items.length - 1]?.seq ?? args.seq)
+    : args.seq;
 
   return { pulled: items.length, nextSeq, items };
 }
@@ -140,11 +170,16 @@ export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
     throw new Error("invalid chatdata item: missing encrypt_random_key/encrypt_chat_msg");
   }
 
+  // 1) RSA decrypt randomKey
   const randomKey = crypto.privateDecrypt(
-    { key: rsaPrivateKeyPem, padding: crypto.constants.RSA_PKCS1_PADDING },
+    {
+      key: rsaPrivateKeyPem,
+      padding: crypto.constants.RSA_PKCS1_PADDING,
+    },
     Buffer.from(encRandomKeyB64, "base64")
   );
 
+  // 2) AES decrypt
   const aesKey = crypto.createHash("sha256").update(randomKey).digest();
   const iv = crypto.createHash("md5").update(randomKey).digest();
 
