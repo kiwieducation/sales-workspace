@@ -24,3 +24,4 @@ node_modules/
 wecom_private.pem
 wecom_private_rsa.pem
 wecom_public.pem
+.DS_Store
