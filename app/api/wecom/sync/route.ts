@@ -42,15 +42,33 @@ function safeReadDir(p: unknown, limit = 80) {
   }
 }
 
-/**
- * 只做 require.resolve + 路径推导，不 require("wework-chat-node")
- * 这样 diag 分支永不触发 native 初始化。
- */
+function findPkgJsonByFs() {
+  // 在 Vercel serverless 里通常 cwd=/var/task
+  // 我们直接用 fs 来定位 node_modules，而不是 require.resolve（会被打包替换成数字 id）
+  const candidates: string[] = [];
+
+  const cwd = process.cwd();
+  // 从 cwd 开始向上找 6 层（足够覆盖 /var/task 以及本地构建差异）
+  let cur = cwd;
+  for (let i = 0; i < 6; i++) {
+    candidates.push(path.join(cur, "node_modules", "wework-chat-node", "package.json"));
+    candidates.push(path.join(cur, "node_modules", ".pnpm", "wework-chat-node", "package.json")); // 兜底
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  for (const p of candidates) {
+    if (safeExists(p)) return p;
+  }
+
+  // 最后兜底：如果未来 Vercel 目录有变化，你至少能看到我们尝试过哪些路径
+  throw new Error(`wework-chat-node package.json not found via fs. tried: ${candidates.join(" | ")}`);
+}
+
 function resolveWeworkPaths() {
   const cwd = process.cwd();
-  const pkgJsonPath = require.resolve("wework-chat-node/package.json", {
-    paths: [cwd],
-  });
+  const pkgJsonPath = findPkgJsonByFs();
 
   const moduleRoot = path.dirname(String(pkgJsonPath));
   const libDir = path.join(moduleRoot, "lib");
