@@ -1,11 +1,11 @@
 // lib/wecom/msgaudit.ts
 import crypto from "crypto";
 import path from "path";
+import fs from "fs";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
 
-// —— 最小依赖：只在 Node 运行期加载 native 包，避免 turbopack/webpack 误处理
 let cached: any = null;
 
 function env(name: string) {
@@ -15,6 +15,40 @@ function mustEnv(name: string) {
   const v = env(name);
   if (!v) throw new Error(`missing env: ${name}`);
   return v;
+}
+
+function safeExists(p: unknown) {
+  try {
+    const s = String(p ?? "");
+    if (!s) return false;
+    fs.accessSync(s, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 终局：不要用 require.resolve 定位包路径（会被 webpack 替换成数字 module id）
+ * 用 fs 从 cwd 向上找 /node_modules/wework-chat-node/package.json
+ */
+function findWeworkPkgJsonByFs() {
+  const candidates: string[] = [];
+
+  let cur = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    candidates.push(path.join(cur, "node_modules", "wework-chat-node", "package.json"));
+    candidates.push(path.join(cur, "node_modules", ".pnpm", "wework-chat-node", "package.json"));
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  for (const p of candidates) {
+    if (safeExists(p)) return p;
+  }
+
+  throw new Error(`wework-chat-node package.json not found via fs`);
 }
 
 function ensureLdLibraryPath(moduleRoot: string) {
@@ -29,14 +63,11 @@ function ensureLdLibraryPath(moduleRoot: string) {
 function loadWeWork() {
   if (cached) return cached;
 
-  // ✅ 固定从 node_modules 找 package.json，拿到真实 moduleRoot
-  const pkgJsonPath = require.resolve("wework-chat-node/package.json");
+  const pkgJsonPath = findWeworkPkgJsonByFs();
   const moduleRoot = path.dirname(pkgJsonPath);
 
-  // ✅ 先把 .so 所在目录放进 LD_LIBRARY_PATH
   ensureLdLibraryPath(moduleRoot);
 
-  // ✅ 再 require 包本体（CJS），兼容 default export
   const mod = require("wework-chat-node");
   cached = mod?.default ? mod.default : mod;
 
@@ -46,11 +77,7 @@ function loadWeWork() {
   return cached;
 }
 
-export async function wecomPullChatData(args: {
-  seq: number;
-  limit: number;
-  timeout: number;
-}) {
+export async function wecomPullChatData(args: { seq: number; limit: number; timeout: number }) {
   const corpId = mustEnv("WECOM_CORP_ID");
   const secret = env("WECOM_CORP_SECRET") || env("WECOM_MSG_ARCHIVE_SECRET");
   if (!secret) throw new Error("missing env: WECOM_CORP_SECRET");
@@ -84,16 +111,11 @@ export function decryptChatDataItem(item: any, rsaPrivateKeyPem: string) {
     throw new Error("invalid chatdata item: missing encrypt_random_key/encrypt_chat_msg");
   }
 
-  // 1) RSA 解 randomKey
   const randomKey = crypto.privateDecrypt(
-    {
-      key: rsaPrivateKeyPem,
-      padding: crypto.constants.RSA_PKCS1_PADDING,
-    },
+    { key: rsaPrivateKeyPem, padding: crypto.constants.RSA_PKCS1_PADDING },
     Buffer.from(encRandomKeyB64, "base64")
   );
 
-  // 2) AES 解密
   const aesKey = crypto.createHash("sha256").update(randomKey).digest();
   const iv = crypto.createHash("md5").update(randomKey).digest();
 

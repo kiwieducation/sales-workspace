@@ -1,56 +1,96 @@
 // app/api/wecom/sync/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { createRequire } from "module";
-import nodePath from "path";
+import { NextResponse } from "next/server";
 import fs from "fs";
-import { wecomPullChatData } from "@/lib/wecom/msgaudit";
+import path from "path";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-const require = createRequire(import.meta.url);
-
-function bearerToken(req: NextRequest) {
-  const auth = req.headers.get("authorization") || "";
-  return auth.replace(/^Bearer\s+/i, "").trim();
+function env(name: string) {
+  return String(process.env[name] ?? "").trim();
+}
+function mustEnv(name: string) {
+  const v = env(name);
+  if (!v) throw new Error(`missing env: ${name}`);
+  return v;
 }
 
-function expectedToken() {
-  return (
-    (process.env.WECOM_SYNC_TOKEN || "").trim() ||
-    (process.env.WECOM_SYNC_BEARER_TOKEN || "").trim() ||
-    (process.env.WECOM_SYNC_SECRET || "").trim()
-  );
-}
-
-function checkAuth(req: NextRequest) {
-  const got = bearerToken(req);
-  const exp = expectedToken();
-  return Boolean(got && exp && got === exp);
-}
-
-function ensureLdLibraryPath(libDir: string) {
-  const cur = (process.env.LD_LIBRARY_PATH || "").trim();
-  const parts = cur.split(":").filter(Boolean);
-  if (!parts.includes(libDir)) {
-    process.env.LD_LIBRARY_PATH = [libDir, ...parts].join(":");
-  }
-}
-
-function fileExists(p: string) {
+function safeExists(p: unknown) {
   try {
-    fs.accessSync(p, fs.constants.R_OK);
+    const s = String(p ?? "");
+    if (!s) return false;
+    fs.accessSync(s, fs.constants.R_OK);
     return true;
   } catch {
     return false;
   }
 }
 
-function listDirSafe(dir: string) {
+function safeReadDir(p: unknown, limit = 80) {
   try {
-    return fs.readdirSync(dir);
+    const s = String(p ?? "");
+    if (!s) return [];
+    return fs.readdirSync(s).slice(0, limit);
   } catch {
     return [];
   }
+}
+
+/**
+ * 终局：不要用 require.resolve（会被 webpack 替换成数字 module id）
+ * 用 fs 从 /var/task (cwd) 向上找 node_modules/wework-chat-node/package.json
+ */
+function findWeworkPkgJsonByFs() {
+  const candidates: string[] = [];
+
+  let cur = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    candidates.push(path.join(cur, "node_modules", "wework-chat-node", "package.json"));
+    // 兜底：如果未来换 pnpm/特殊布局，也至少尝试一下
+    candidates.push(path.join(cur, "node_modules", ".pnpm", "wework-chat-node", "package.json"));
+
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  for (const p of candidates) {
+    if (safeExists(p)) return p;
+  }
+
+  throw new Error(
+    `wework-chat-node package.json not found via fs. tried: ${candidates.join(" | ")}`
+  );
+}
+
+function ensureLdLibraryPath(weworkLibDir?: string) {
+  if (process.platform !== "linux") return String(process.env.LD_LIBRARY_PATH || "");
+
+  const parts = [
+    safeExists(weworkLibDir) ? String(weworkLibDir) : "",
+    process.env.LD_LIBRARY_PATH || "",
+  ].filter(Boolean);
+
+  process.env.LD_LIBRARY_PATH = parts.join(":");
+  return process.env.LD_LIBRARY_PATH;
+}
+
+function resolveWeworkPaths() {
+  const cwd = process.cwd();
+  const pkgJsonPath = findWeworkPkgJsonByFs();
+  const moduleRoot = path.dirname(pkgJsonPath);
+  const libDir = path.join(moduleRoot, "lib");
+  const soPath = path.join(libDir, "libWeWorkFinanceSdk_C.so");
+
+  return {
+    cwd,
+    pkgJsonPath,
+    moduleRoot,
+    libDir,
+    soPath,
+    soExists: safeExists(soPath),
+    libFiles: safeExists(libDir) ? safeReadDir(libDir, 120) : [],
+  };
 }
 
 function num(v: any, fallback: number) {
@@ -58,121 +98,99 @@ function num(v: any, fallback: number) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function runNativeDiag() {
-  // 任何情况下都返回 JSON，不让 diag 本身炸 500
-  const out: any = {
-    runtime: {
-      node: process.version.replace(/^v/, ""),
-      platform: process.platform,
-      arch: process.arch,
-    },
-    ldLibraryPath: process.env.LD_LIBRARY_PATH || "",
-    paths: {
-      cwd: process.cwd(),
-      pkgJsonPath: "",
-      moduleRoot: "",
-      libDir: "",
-      soPath: "",
-      soExists: false,
-      libFiles: [] as string[],
-      hasWeWorkChatExport: null as null | boolean,
-    },
-    diagError: null as null | string,
-  };
-
+export async function POST(req: Request) {
   try {
-    // ✅ 强制字符串化，杜绝 number 混入
-    const pkgJsonPath = String(
-      require.resolve("wework-chat-node/package.json")
-    );
-    out.paths.pkgJsonPath = pkgJsonPath;
+    // 1) Bearer token
+    const auth = req.headers.get("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    const expected = mustEnv("WECOM_SYNC_TOKEN");
 
-    const moduleRoot = nodePath.dirname(pkgJsonPath);
-    out.paths.moduleRoot = moduleRoot;
-
-    const libDir = nodePath.join(moduleRoot, "lib");
-    out.paths.libDir = libDir;
-
-    ensureLdLibraryPath(libDir);
-    out.ldLibraryPath = process.env.LD_LIBRARY_PATH || "";
-
-    const soPath = nodePath.join(libDir, "libWeWorkFinanceSdk_C.so");
-    out.paths.soPath = soPath;
-    out.paths.soExists = fileExists(soPath);
-    out.paths.libFiles = listDirSafe(libDir);
-
-    // 触发加载 native addon（如果失败也不炸，只记录错误）
-    try {
-      const mod = require("wework-chat-node");
-      const resolved = mod?.default ? mod.default : mod;
-      out.paths.hasWeWorkChatExport = Boolean(resolved?.WeWorkChat);
-    } catch (e: any) {
-      out.paths.hasWeWorkChatExport = false;
-      out.diagError = out.diagError || (e?.message || String(e));
-    }
-  } catch (e: any) {
-    out.diagError = e?.message || String(e);
-  }
-
-  return out;
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    if (!checkAuth(req)) {
-      return NextResponse.json(
-        { ok: false, error: "unauthorized" },
-        { status: 401 }
-      );
+    if (!token || token !== expected) {
+      return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
     }
 
-    const body = await req.json().catch(() => ({}));
+    // 2) body
+    const body = (await req.json().catch(() => ({}))) as any;
 
+    // 3) diag：验证 native 包是否真实在 /var/task/node_modules
     if (body?.diag === true) {
-      const diag = runNativeDiag();
-      return NextResponse.json({ ok: true, diag: true, ...diag });
+      let paths: any = null;
+      let diagError: string | null = null;
+
+      try {
+        paths = resolveWeworkPaths();
+        ensureLdLibraryPath(paths?.libDir);
+      } catch (e: any) {
+        diagError = e?.message || String(e);
+      }
+
+      return NextResponse.json({
+        ok: true,
+        diag: true,
+        runtime: { node: process.versions.node, platform: process.platform, arch: process.arch },
+        ldLibraryPath: String(process.env.LD_LIBRARY_PATH || ""),
+        paths,
+        diagError,
+      });
     }
 
+    // 4) params
     const seq = num(body?.seq ?? 0, 0);
-    const limit = num(body?.maxResults ?? body?.limit ?? 10, 10);
-    const timeout = num(body?.timeout ?? 10, 10);
+    const maxResults = Math.min(num(body?.maxResults ?? 50, 50), 1000);
+    const timeout = Math.min(Math.max(num(body?.timeout ?? 10, 10), 1), 60);
 
-    if (!Number.isFinite(seq) || seq < 0) {
-      return NextResponse.json(
-        { ok: false, error: "invalid seq" },
-        { status: 400 }
-      );
-    }
-    if (!Number.isFinite(limit) || limit <= 0 || limit > 1000) {
-      return NextResponse.json(
-        { ok: false, error: "invalid maxResults/limit" },
-        { status: 400 }
-      );
-    }
-    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 300) {
-      return NextResponse.json(
-        { ok: false, error: "invalid timeout" },
-        { status: 400 }
-      );
+    // 5) 在加载 native 前设置 LD_LIBRARY_PATH（终局必做）
+    try {
+      const nativeInfo = resolveWeworkPaths();
+      ensureLdLibraryPath(nativeInfo?.libDir);
+    } catch {
+      // 不阻断，让真正加载时报错（会在返回 JSON 里看到）
     }
 
-    // ✅ 不写盘 / 不 mkdir / 不碰 /var/task
-    const result = await wecomPullChatData({ seq, limit, timeout });
-    return NextResponse.json({ ok: true, ...result });
-  } catch (err: any) {
-    console.error("[wecom-sync] error:", err);
+    // 6) 延迟 import（避免初始化阶段触发 native）
+    const { wecomPullChatData, decryptChatDataItem } = await import("@/lib/wecom/msgaudit");
+
+    const rsaPrivateKeyPem = mustEnv("WECOM_MSG_ARCHIVE_PRIVATE_KEY").replace(/\\n/g, "\n");
+
+    const pulledRet = await wecomPullChatData({ seq, limit: maxResults, timeout });
+
+    const items = pulledRet.items ?? [];
+    const nextSeq = pulledRet.nextSeq ?? seq;
+
+    // 解密第一条验证链路
+    let firstOk = false;
+    let firstMsgid: string | null = null;
+    let firstError: string | null = null;
+
+    if (items.length > 0) {
+      try {
+        const dec = decryptChatDataItem(items[0], rsaPrivateKeyPem);
+        firstOk = true;
+        firstMsgid = dec?.msgid ?? null;
+      } catch (e: any) {
+        firstError = e?.message || String(e);
+      }
+    }
+
+    return NextResponse.json({
+      ok: true,
+      seq,
+      pulled: pulledRet.pulled ?? items.length,
+      nextSeq,
+      firstOk,
+      firstMsgid,
+      firstError,
+      runtime: { node: process.versions.node, platform: process.platform, arch: process.arch },
+    });
+  } catch (e: any) {
+    const msg = e?.message || String(e);
     return NextResponse.json(
       {
         ok: false,
-        error: err?.message || "internal error",
-        name: err?.name,
-        cause: err?.cause ?? null,
-        hint: err?.hint ?? null,
-        runtime: {
-          node: process.version.replace(/^v/, ""),
-          platform: process.platform,
-          arch: process.arch,
-        },
+        error: msg,
+        name: e?.name || "Error",
+        cause: e?.cause?.message || e?.cause || null,
+        runtime: { node: process.versions.node, platform: process.platform, arch: process.arch },
       },
       { status: 500 }
     );
