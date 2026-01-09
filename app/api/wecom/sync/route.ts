@@ -1,5 +1,6 @@
 // app/api/wecom/sync/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import fs from "fs";
 import { wecomPullChatData } from "@/lib/wecom/msgaudit";
 
 export const runtime = "nodejs";
@@ -14,8 +15,43 @@ function isAuthed(req: NextRequest) {
   return Boolean(token) && auth === `Bearer ${token}`;
 }
 
+function fileReadable(p: string) {
+  try {
+    fs.accessSync(p, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ✅ 终局：在 route 层注入 native TLS 的 CA bundle
+ * - 影响 libcurl/OpenSSL（wework-chat-node 内部）
+ * - 不依赖 Node 的 TLS/证书行为
+ * - 只要 Vercel runtime 有任意一个 CA 路径存在，就能稳定工作
+ */
+function ensureNativeCaBundleEnv() {
+  // 如果用户已经手动配置了，就不覆盖
+  if (process.env.SSL_CERT_FILE || process.env.CURL_CA_BUNDLE) return;
+
+  const candidates = [
+    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt", // RHEL/CentOS
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+  ];
+
+  const found = candidates.find((p) => fileReadable(p));
+  if (found) {
+    process.env.SSL_CERT_FILE = found;
+    process.env.CURL_CA_BUNDLE = found;
+    if (!process.env.SSL_CERT_DIR && fileReadable("/etc/ssl/certs")) {
+      process.env.SSL_CERT_DIR = "/etc/ssl/certs";
+    }
+  }
+}
+
 async function nodeFetchProbe() {
-  // 只验证：Vercel Node runtime 是否能建立 TLS 连接到企业微信域名
   try {
     const r = await fetch("https://qyapi.weixin.qq.com", { cache: "no-store" });
     return { ok: true, status: r.status };
@@ -26,6 +62,9 @@ async function nodeFetchProbe() {
 
 export async function POST(req: NextRequest) {
   try {
+    // ✅ 必须最早执行：确保后续 native SDK 发 HTTPS 时有 CA
+    ensureNativeCaBundleEnv();
+
     if (!isAuthed(req)) {
       return json({ ok: false, error: "unauthorized" }, 401);
     }
@@ -50,7 +89,6 @@ export async function POST(req: NextRequest) {
           hasSyncToken: Boolean(process.env.WECOM_SYNC_TOKEN),
         },
         tlsEnv: {
-          // 这些如果是 null/空，native libcurl/OpenSSL 可能就找不到 CA
           SSL_CERT_FILE: process.env.SSL_CERT_FILE || null,
           SSL_CERT_DIR: process.env.SSL_CERT_DIR || null,
           CURL_CA_BUNDLE: process.env.CURL_CA_BUNDLE || null,
