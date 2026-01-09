@@ -11,7 +11,7 @@ function json(data: any, status = 200) {
 
 function isAuthed(req: NextRequest) {
   const auth = req.headers.get("authorization") || "";
-  const token = process.env.WECOM_SYNC_TOKEN || "";
+  const token = (process.env.WECOM_SYNC_TOKEN || "").trim();
   return Boolean(token) && auth === `Bearer ${token}`;
 }
 
@@ -25,18 +25,15 @@ function fileReadable(p: string) {
 }
 
 /**
- * ✅ 终局：在 route 层注入 native TLS 的 CA bundle
- * - 影响 libcurl/OpenSSL（wework-chat-node 内部）
- * - 不依赖 Node 的 TLS/证书行为
- * - 只要 Vercel runtime 有任意一个 CA 路径存在，就能稳定工作
+ * ✅ 给 native libcurl/OpenSSL 指定 CA bundle
+ * 让 wework-chat-node 的 HTTPS 校验在 Serverless 环境稳定可复现
  */
 function ensureNativeCaBundleEnv() {
-  // 如果用户已经手动配置了，就不覆盖
   if (process.env.SSL_CERT_FILE || process.env.CURL_CA_BUNDLE) return;
 
   const candidates = [
-    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
-    "/etc/pki/tls/certs/ca-bundle.crt", // RHEL/CentOS
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
   ];
@@ -60,19 +57,71 @@ async function nodeFetchProbe() {
   }
 }
 
+/**
+ * ✅ 用同一套 corpId+secret 调 gettoken
+ * - 不回传 access_token，避免泄露
+ * - 用来“一刀切”判断 secret/corpId 是否正确
+ */
+async function wecomGetTokenProbe() {
+  const corpId = (process.env.WECOM_CORP_ID || "").trim();
+  const secret = (
+    process.env.WECOM_MSG_ARCHIVE_SECRET ||
+    process.env.WECOM_CORP_SECRET ||
+    ""
+  ).trim();
+
+  if (!corpId || !secret) {
+    return {
+      ok: false,
+      error: "missing WECOM_CORP_ID or (WECOM_MSG_ARCHIVE_SECRET/WECOM_CORP_SECRET)",
+    };
+  }
+
+  try {
+    const url =
+      `https://qyapi.weixin.qq.com/cgi-bin/gettoken` +
+      `?corpid=${encodeURIComponent(corpId)}` +
+      `&corpsecret=${encodeURIComponent(secret)}`;
+
+    const r = await fetch(url, { cache: "no-store" });
+    const j: any = await r.json().catch(() => ({}));
+
+    return {
+      ok: true,
+      httpStatus: r.status,
+      errcode: j?.errcode,
+      errmsg: j?.errmsg,
+      hasAccessToken: Boolean(j?.access_token),
+      expiresIn: typeof j?.expires_in === "number" ? j.expires_in : null,
+      // 只告诉你用的是哪一个 secret 名称（不泄露值）
+      usingSecret: process.env.WECOM_MSG_ARCHIVE_SECRET
+        ? "WECOM_MSG_ARCHIVE_SECRET"
+        : process.env.WECOM_CORP_SECRET
+        ? "WECOM_CORP_SECRET"
+        : "NONE",
+    };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
-    // ✅ 必须最早执行：确保后续 native SDK 发 HTTPS 时有 CA
+    // ✅ 最早注入：确保后续 native SDK 发 HTTPS 时有 CA
     ensureNativeCaBundleEnv();
 
     if (!isAuthed(req)) {
       return json({ ok: false, error: "unauthorized" }, 401);
     }
 
-    const body = await req.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({} as any));
 
     if (body?.diag === true) {
-      const probe = await nodeFetchProbe();
+      const [probe, tokenProbe] = await Promise.all([
+        nodeFetchProbe(),
+        wecomGetTokenProbe(),
+      ]);
+
       return json({
         ok: true,
         diag: true,
@@ -96,12 +145,23 @@ export async function POST(req: NextRequest) {
           LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || null,
         },
         nodeFetchProbe: probe,
+        wecomGetTokenProbe: tokenProbe,
       });
     }
 
     const seq = Number(body?.seq ?? 0);
     const limit = Number(body?.maxResults ?? 1);
     const timeout = Number(body?.timeout ?? 1);
+
+    if (!Number.isFinite(seq) || seq < 0) {
+      return json({ ok: false, error: "invalid seq" }, 400);
+    }
+    if (!Number.isFinite(limit) || limit <= 0 || limit > 1000) {
+      return json({ ok: false, error: "invalid maxResults" }, 400);
+    }
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 60) {
+      return json({ ok: false, error: "invalid timeout" }, 400);
+    }
 
     const result = await wecomPullChatData({ seq, limit, timeout });
     return json({ ok: true, ...result });
