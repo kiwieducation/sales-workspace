@@ -10,33 +10,21 @@ function json(data: any, status = 200) {
 
 function isAuthed(req: NextRequest) {
   const auth = req.headers.get("authorization") || "";
-  const token = process.env.WECOM_SYNC_AUTH_TOKEN || "";
+  const token = process.env.WECOM_SYNC_TOKEN || "";
   return Boolean(token) && auth === `Bearer ${token}`;
-}
-
-async function nodeFetchProbe() {
-  try {
-    const r = await fetch("https://qyapi.weixin.qq.com", {
-      method: "GET",
-      cache: "no-store",
-    });
-    return { ok: true, status: r.status };
-  } catch (e: any) {
-    return { ok: false, error: String(e?.message || e) };
-  }
 }
 
 export async function POST(req: NextRequest) {
   try {
+    // 1) 鉴权
     if (!isAuthed(req)) {
       return json({ ok: false, error: "unauthorized" }, 401);
     }
 
-    const body = await req.json().catch(() => ({} as any));
-    const diag = Boolean(body?.diag);
+    const body = await req.json().catch(() => ({}));
 
-    if (diag) {
-      const probe = await nodeFetchProbe();
+    // 2) 诊断模式（只看运行环境，不调用接口）
+    if (body?.diag === true) {
       return json({
         ok: true,
         diag: true,
@@ -45,40 +33,53 @@ export async function POST(req: NextRequest) {
           platform: process.platform,
           arch: process.arch,
         },
-        tlsEnv: {
-          SSL_CERT_FILE: process.env.SSL_CERT_FILE || null,
-          SSL_CERT_DIR: process.env.SSL_CERT_DIR || null,
-          CURL_CA_BUNDLE: process.env.CURL_CA_BUNDLE || null,
-          NODE_OPTIONS: process.env.NODE_OPTIONS || null,
-          LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || null,
+        env: {
+          hasCorpId: Boolean(process.env.WECOM_CORP_ID),
+          hasCorpSecret: Boolean(process.env.WECOM_CORP_SECRET),
+          hasPrivateKey: Boolean(process.env.WECOM_MSG_ARCHIVE_PRIVATE_KEY),
+          hasSyncToken: Boolean(process.env.WECOM_SYNC_TOKEN),
         },
-        nodeFetchProbe: probe,
       });
     }
 
+    // 3) 参数校验
     const seq = Number(body?.seq ?? 0);
-    const maxResults = Number(body?.maxResults ?? 1);
-    const timeout = Number(body?.timeout ?? 1);
+    const limit = Number(body?.maxResults ?? 100);
+    const timeout = Number(body?.timeout ?? 30);
 
-    if (!Number.isFinite(seq) || seq < 0) return json({ ok: false, error: "invalid seq" }, 400);
-    if (!Number.isFinite(maxResults) || maxResults <= 0 || maxResults > 1000)
-      return json({ ok: false, error: "invalid maxResults" }, 400);
-    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 60)
-      return json({ ok: false, error: "invalid timeout" }, 400);
+    if (!Number.isFinite(seq) || seq < 0) {
+      return json({ ok: false, error: "invalid seq" }, 400);
+    }
 
-    const res = await wecomPullChatData({ seq, limit: maxResults, timeout });
-    return json({ ok: true, ...res });
-  } catch (e: any) {
+    // 4) 真正调用会话内容存档
+    try {
+      const result = await wecomPullChatData({
+        seq,
+        limit,
+        timeout,
+      });
+
+      return json({
+        ok: true,
+        ...result,
+      });
+    } catch (err: any) {
+      // 关键：把 ret/errmsg 原样返回
+      return json(
+        {
+          ok: false,
+          error: err?.message || String(err),
+          name: err?.name,
+        },
+        500
+      );
+    }
+  } catch (err: any) {
     return json(
       {
         ok: false,
-        error: String(e?.message || e),
-        name: e?.name || "Error",
-        runtime: {
-          node: process.version,
-          platform: process.platform,
-          arch: process.arch,
-        },
+        error: err?.message || String(err),
+        name: err?.name,
       },
       500
     );
