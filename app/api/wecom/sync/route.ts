@@ -14,17 +14,26 @@ function isAuthed(req: NextRequest) {
   return Boolean(token) && auth === `Bearer ${token}`;
 }
 
+async function nodeFetchProbe() {
+  // 只验证：Vercel Node runtime 是否能建立 TLS 连接到企业微信域名
+  try {
+    const r = await fetch("https://qyapi.weixin.qq.com", { cache: "no-store" });
+    return { ok: true, status: r.status };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
-    // 1) 鉴权
     if (!isAuthed(req)) {
       return json({ ok: false, error: "unauthorized" }, 401);
     }
 
     const body = await req.json().catch(() => ({}));
 
-    // 2) 诊断模式（只看运行环境，不调用接口）
     if (body?.diag === true) {
+      const probe = await nodeFetchProbe();
       return json({
         ok: true,
         diag: true,
@@ -36,50 +45,34 @@ export async function POST(req: NextRequest) {
         env: {
           hasCorpId: Boolean(process.env.WECOM_CORP_ID),
           hasCorpSecret: Boolean(process.env.WECOM_CORP_SECRET),
+          hasArchiveSecret: Boolean(process.env.WECOM_MSG_ARCHIVE_SECRET),
           hasPrivateKey: Boolean(process.env.WECOM_MSG_ARCHIVE_PRIVATE_KEY),
           hasSyncToken: Boolean(process.env.WECOM_SYNC_TOKEN),
         },
-      });
-    }
-
-    // 3) 参数校验
-    const seq = Number(body?.seq ?? 0);
-    const limit = Number(body?.maxResults ?? 100);
-    const timeout = Number(body?.timeout ?? 30);
-
-    if (!Number.isFinite(seq) || seq < 0) {
-      return json({ ok: false, error: "invalid seq" }, 400);
-    }
-
-    // 4) 真正调用会话内容存档
-    try {
-      const result = await wecomPullChatData({
-        seq,
-        limit,
-        timeout,
-      });
-
-      return json({
-        ok: true,
-        ...result,
-      });
-    } catch (err: any) {
-      // 关键：把 ret/errmsg 原样返回
-      return json(
-        {
-          ok: false,
-          error: err?.message || String(err),
-          name: err?.name,
+        tlsEnv: {
+          // 这些如果是 null/空，native libcurl/OpenSSL 可能就找不到 CA
+          SSL_CERT_FILE: process.env.SSL_CERT_FILE || null,
+          SSL_CERT_DIR: process.env.SSL_CERT_DIR || null,
+          CURL_CA_BUNDLE: process.env.CURL_CA_BUNDLE || null,
+          NODE_OPTIONS: process.env.NODE_OPTIONS || null,
+          LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || null,
         },
-        500
-      );
+        nodeFetchProbe: probe,
+      });
     }
-  } catch (err: any) {
+
+    const seq = Number(body?.seq ?? 0);
+    const limit = Number(body?.maxResults ?? 1);
+    const timeout = Number(body?.timeout ?? 1);
+
+    const result = await wecomPullChatData({ seq, limit, timeout });
+    return json({ ok: true, ...result });
+  } catch (e: any) {
     return json(
       {
         ok: false,
-        error: err?.message || String(err),
-        name: err?.name,
+        error: String(e?.message || e),
+        name: e?.name || "Error",
       },
       500
     );
